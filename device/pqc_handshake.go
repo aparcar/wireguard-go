@@ -140,7 +140,7 @@ func BuildPQCMsg1(localStaticPub NoisePQCPublicKey, remoteStaticPub NoisePQCPubl
 
 	// Bind timestamp to PQC transcript for hybrid protection
 	// This ensures an attacker must break both X25519 AND ML-KEM-768 to forge timestamps
-	// ks.mixHash(timestamp[:])
+	ks.mixHash(timestamp[:])
 
 	// -> skem (encapsulate to responder's static key)
 	ssSS, ctSS, err := PQCEncapsulate(remoteStaticPub)
@@ -193,7 +193,7 @@ func ProcessPQCMsg1(
 
 	// Bind timestamp to PQC transcript for hybrid protection
 	// Must match the timestamp mixed in by the initiator
-	// ks.mixHash(timestamp[:])
+	ks.mixHash(timestamp[:])
 
 	// <- skem (decapsulate with our static key)
 	ssSS, err := PQCDecapsulate(localStaticPriv, ctss)
