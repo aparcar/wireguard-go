@@ -53,6 +53,9 @@ type Device struct {
 		sync.RWMutex
 		privateKey NoisePrivateKey
 		publicKey  NoisePublicKey
+		// PQC (Post-Quantum Cryptography) keys for ML-KEM-768
+		pqcSeed      NoisePQCSeed
+		pqcPublicKey NoisePQCPublicKey
 	}
 
 	peers struct {
@@ -284,6 +287,56 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	return nil
 }
 
+// SetPQCSeed sets the device's PQC (ML-KEM-768) seed for post-quantum handshakes.
+// The corresponding public key is derived automatically.
+func (device *Device) SetPQCSeed(seed NoisePQCSeed) error {
+	device.staticIdentity.Lock()
+	defer device.staticIdentity.Unlock()
+
+	if seed.Equals(device.staticIdentity.pqcSeed) {
+		return nil
+	}
+
+	// Derive the public key from the seed (we don't need the decapsulation key here)
+	pub, _, err := PQCGenerateKeyPairFromSeed(seed)
+	if err != nil {
+		return err
+	}
+
+	device.staticIdentity.pqcSeed = seed
+	device.staticIdentity.pqcPublicKey = pub
+
+	device.log.Verbosef("PQC seed set, public key derived")
+
+	return nil
+}
+
+// GetPQCPublicKey returns the device's PQC public key.
+func (device *Device) GetPQCPublicKey() NoisePQCPublicKey {
+	device.staticIdentity.RLock()
+	defer device.staticIdentity.RUnlock()
+	return device.staticIdentity.pqcPublicKey
+}
+
+// GeneratePQCKeyPair generates a new random PQC key pair for the device.
+// The seed and public key are stored in the device's static identity.
+func (device *Device) GeneratePQCKeyPair() error {
+	device.staticIdentity.Lock()
+	defer device.staticIdentity.Unlock()
+
+	pub, seed, err := PQCGenerateKeyPair()
+	if err != nil {
+		return err
+	}
+
+	device.staticIdentity.pqcSeed = seed
+	device.staticIdentity.pqcPublicKey = pub
+
+	device.log.Verbosef("Generated new PQC key pair")
+
+	return nil
+}
+
 func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device := new(Device)
 	device.state.state.Store(uint32(deviceStateDown))
@@ -394,6 +447,26 @@ func (device *Device) LookupActivePeer(pk NoisePublicKey) (_ *Peer, ok bool) {
 	defer device.peers.RUnlock()
 	p, ok := device.peers.keyMap[pk]
 	return p, ok
+}
+
+// LookupPeerByPQCKey looks up a peer by its PQC public key.
+// Returns nil if no peer with this PQC key is found.
+func (device *Device) LookupPeerByPQCKey(pqcPK NoisePQCPublicKey) *Peer {
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+
+	// Iterate through all peers to find matching PQC key
+	for _, peer := range device.peers.keyMap { // TODO aparcar
+		peer.handshake.mutex.RLock()
+		remotePQCStatic := peer.handshake.remotePQCStatic
+		peer.handshake.mutex.RUnlock()
+
+		if remotePQCStatic == pqcPK {
+			return peer
+		}
+	}
+
+	return nil
 }
 
 var errAddExistingPeer = errors.New("adding existing peer")

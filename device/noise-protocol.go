@@ -6,6 +6,7 @@
 package device
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -55,21 +56,25 @@ const (
 )
 
 const (
-	MessageInitiationType  = 1
-	MessageResponseType    = 2
-	MessageCookieReplyType = 3
-	MessageTransportType   = 4
+	MessageInitiationType    = 1
+	MessageResponseType      = 2
+	MessageCookieReplyType   = 3
+	MessageTransportType     = 4
+	MessagePQCInitiationType = 5
+	MessagePQCResponseType   = 6
 )
 
 const (
-	MessageInitiationSize             = 148                                           // size of handshake initiation message
-	MessageResponseSize               = 92                                            // size of response message
-	MessageCookieReplySize            = 64                                            // size of cookie reply message
-	MessageTransportHeaderSize        = 16                                            // size of data preceding content in transport message
-	MessageEncapsulatingTransportSize = 8                                             // size of optional, free (for use by conn.Bind.Send()) space preceding the transport header
-	MessageTransportSize              = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
-	MessageKeepaliveSize              = MessageTransportSize                          // size of keepalive
-	MessageHandshakeSize              = MessageInitiationSize                         // size of largest handshake related message
+	MessageInitiationSize             = 148                                                                                                                 // size of handshake initiation message
+	MessageResponseSize               = 92                                                                                                                  // size of response message
+	MessageCookieReplySize            = 64                                                                                                                  // size of cookie reply message
+	MessageTransportHeaderSize        = 16                                                                                                                  // size of data preceding content in transport message
+	MessageEncapsulatingTransportSize = 8                                                                                                                   // size of optional, free (for use by conn.Bind.Send()) space preceding the transport header
+	MessageTransportSize              = MessageTransportHeaderSize + poly1305.TagSize                                                                       // size of empty transport
+	MessageKeepaliveSize              = MessageTransportSize                                                                                                // size of keepalive
+	MessageHandshakeSize              = MessageInitiationSize                                                                                               // size of largest handshake related message
+	MessagePQCInitiationSize          = MessageInitiationSize + NoisePQCCiphertextSize + NoisePQCPublicKeySize + (NoisePQCPublicKeySize + poly1305.TagSize) // Standard initiation (148) + CTss(1088) + EI(1184) + EncSI(1200) = 3620 bytes
+	MessagePQCResponseSize            = MessageResponseSize + NoisePQCCiphertextSize + NoisePQCCiphertextSize                                               // Standard response (92) + ER(1184) + CTee(1088) + CTse(1088) = 2268 bytes
 )
 
 const (
@@ -116,6 +121,43 @@ type MessageCookieReply struct {
 	Receiver uint32
 	Nonce    [chacha20poly1305.NonceSizeX]byte
 	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+}
+
+// MessagePQCInitiation extends the standard MessageInitiation with PQC fields
+// Structure: [Standard Initiation Fields] + [PQC Extension Fields]
+// This allows hybrid X25519+ML-KEM-768 security
+type MessagePQCInitiation struct {
+	// Standard WireGuard initiation fields (reused for X25519 handshake)
+	Type      uint32
+	Sender    uint32
+	Ephemeral NoisePublicKey                                // X25519 ephemeral public key (32 bytes)
+	Static    [NoisePublicKeySize + poly1305.TagSize]byte   // Encrypted X25519 static key (32 + 16 bytes)
+	Timestamp [tai64n.TimestampSize + poly1305.TagSize]byte // Encrypted timestamp (12 + 16 bytes)
+	MAC1      [blake2s.Size128]byte                         // MAC1 for standard part (16 bytes)
+	MAC2      [blake2s.Size128]byte                         // MAC2 for standard part (16 bytes)
+
+	// PQC extension fields (appended after standard message)
+	CTss  NoisePQCCiphertext                             // ML-KEM-768 ciphertext from skem (1088 bytes)
+	EI    NoisePQCPublicKey                              // ML-KEM-768 ephemeral public key (1184 bytes)
+	EncSI [NoisePQCPublicKeySize + poly1305.TagSize]byte // Encrypted ML-KEM-768 static key (1184 + 16 bytes)
+}
+
+// MessagePQCResponse extends the standard MessageResponse with PQC fields
+// Structure: [Standard Response Fields] + [PQC Extension Fields]
+// This allows hybrid X25519+ML-KEM-768 security
+type MessagePQCResponse struct {
+	// Standard WireGuard response fields (reused for X25519 handshake)
+	Type      uint32
+	Sender    uint32
+	Receiver  uint32
+	Ephemeral NoisePublicKey         // X25519 ephemeral public key (32 bytes)
+	Empty     [poly1305.TagSize]byte // Encrypted empty (16 bytes)
+	MAC1      [blake2s.Size128]byte  // MAC1 for standard part (16 bytes)
+	MAC2      [blake2s.Size128]byte  // MAC2 for standard part (16 bytes)
+
+	// PQC extension fields (appended after standard message)
+	CTee NoisePQCCiphertext // ML-KEM-768 ciphertext from ekem (1088 bytes)
+	CTse NoisePQCCiphertext // ML-KEM-768 ciphertext from skem (1088 bytes)
 }
 
 var errMessageLengthMismatch = errors.New("message length mismatch")
@@ -210,12 +252,112 @@ func (msg *MessageCookieReply) marshal(b []byte) error {
 	return nil
 }
 
+func (msg *MessagePQCInitiation) unmarshal(b []byte) error {
+	if len(b) != MessagePQCInitiationSize {
+		return errMessageLengthMismatch
+	}
+
+	// Unmarshal standard WireGuard initiation fields (first 148 bytes)
+	msg.Type = binary.LittleEndian.Uint32(b)
+	msg.Sender = binary.LittleEndian.Uint32(b[4:])
+	copy(msg.Ephemeral[:], b[8:])
+	copy(msg.Static[:], b[40:])
+	copy(msg.Timestamp[:], b[88:])
+	copy(msg.MAC1[:], b[116:])
+	copy(msg.MAC2[:], b[132:])
+
+	// Unmarshal PQC extension fields (after standard 148 bytes)
+	offset := MessageInitiationSize
+	copy(msg.CTss[:], b[offset:])
+	offset += len(msg.CTss)
+	copy(msg.EI[:], b[offset:])
+	offset += len(msg.EI)
+	copy(msg.EncSI[:], b[offset:])
+	fmt.Printf("encsi %x", msg.EncSI)
+
+
+	return nil
+}
+
+func (msg *MessagePQCInitiation) marshal(b []byte) error {
+	if len(b) != MessagePQCInitiationSize {
+		return errMessageLengthMismatch
+	}
+
+	// Marshal standard WireGuard initiation fields (first 148 bytes)
+	binary.LittleEndian.PutUint32(b, msg.Type)
+	binary.LittleEndian.PutUint32(b[4:], msg.Sender)
+	copy(b[8:], msg.Ephemeral[:])
+	copy(b[40:], msg.Static[:])
+	copy(b[88:], msg.Timestamp[:])
+	copy(b[116:], msg.MAC1[:])
+	copy(b[132:], msg.MAC2[:])
+
+	// Marshal PQC extension fields (after standard 148 bytes)
+	offset := MessageInitiationSize
+	copy(b[offset:], msg.CTss[:])
+	offset += len(msg.CTss)
+	copy(b[offset:], msg.EI[:])
+	offset += len(msg.EI)
+	copy(b[offset:], msg.EncSI[:])
+	fmt.Printf("encsi %x", msg.EncSI)
+
+	return nil
+}
+
+func (msg *MessagePQCResponse) unmarshal(b []byte) error {
+	if len(b) != MessagePQCResponseSize {
+		return errMessageLengthMismatch
+	}
+
+	// Unmarshal standard WireGuard response fields (first 92 bytes)
+	msg.Type = binary.LittleEndian.Uint32(b)
+	msg.Sender = binary.LittleEndian.Uint32(b[4:])
+	msg.Receiver = binary.LittleEndian.Uint32(b[8:])
+	copy(msg.Ephemeral[:], b[12:])
+	copy(msg.Empty[:], b[44:])
+	copy(msg.MAC1[:], b[60:])
+	copy(msg.MAC2[:], b[76:])
+
+	// Unmarshal PQC extension fields (after standard 92 bytes)
+	offset := MessageResponseSize
+	copy(msg.CTee[:], b[offset:])
+	offset += len(msg.CTee)
+	copy(msg.CTse[:], b[offset:])
+
+	return nil
+}
+
+func (msg *MessagePQCResponse) marshal(b []byte) error {
+	if len(b) != MessagePQCResponseSize {
+		return errMessageLengthMismatch
+	}
+
+	// Marshal standard WireGuard response fields (first 92 bytes)
+	binary.LittleEndian.PutUint32(b, msg.Type)
+	binary.LittleEndian.PutUint32(b[4:], msg.Sender)
+	binary.LittleEndian.PutUint32(b[8:], msg.Receiver)
+	copy(b[12:], msg.Ephemeral[:])
+	copy(b[44:], msg.Empty[:])
+	copy(b[60:], msg.MAC1[:])
+	copy(b[76:], msg.MAC2[:])
+
+	// Marshal PQC extension fields (after standard 92 bytes)
+	offset := MessageResponseSize
+	copy(b[offset:], msg.CTee[:])
+	offset += len(msg.CTee)
+	copy(b[offset:], msg.CTse[:])
+
+	return nil
+}
+
 type Handshake struct {
 	state                     handshakeState
 	mutex                     sync.RWMutex
 	hash                      [blake2s.Size]byte       // hash value
 	chainKey                  [blake2s.Size]byte       // chain key
 	presharedKey              NoisePresharedKey        // psk
+	pqcKey                    NoisePresharedKey        // PQC-derived key (or PQC ⊕ PSK if both set)
 	localEphemeral            NoisePrivateKey          // ephemeral secret key
 	localIndex                uint32                   // used to clear hash-table
 	remoteIndex               uint32                   // index for sending
@@ -225,6 +367,11 @@ type Handshake struct {
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
+	// PQC state
+	remotePQCStatic     NoisePQCPublicKey // remote PQC public key
+	pqcEphemeralPrivate NoisePQCSeed      // PQC ephemeral private key (for initiation)
+	pqcKeySchedule      *pqKeySchedule    // PQC key schedule state
+	pqcRemoteEphemeral  NoisePQCPublicKey // remote PQC ephemeral key (stored during initiation consumption)
 }
 
 var (
@@ -497,12 +644,18 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	var tau [blake2s.Size]byte
 	var key [chacha20poly1305.KeySize]byte
 
+	// If either is unset (all zeros), XOR with zeros is a no-op
+	var combinedKey NoisePresharedKey
+	for i := range combinedKey {
+		combinedKey[i] = handshake.presharedKey[i] ^ handshake.pqcKey[i]
+	}
+
 	KDF3(
 		&handshake.chainKey,
 		&tau,
 		&key,
 		handshake.chainKey[:],
-		handshake.presharedKey[:],
+		combinedKey[:],
 	)
 
 	handshake.mixHash(tau[:])
@@ -569,6 +722,11 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		setZero(ss[:])
 
 		// add preshared key (psk)
+		// If either is unset (all zeros), XOR with zeros is a no-op
+		var combinedKey NoisePresharedKey
+		for i := range combinedKey {
+			combinedKey[i] = handshake.presharedKey[i] ^ handshake.pqcKey[i]
+		}
 
 		var tau [blake2s.Size]byte
 		var key [chacha20poly1305.KeySize]byte
@@ -577,7 +735,7 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 			&tau,
 			&key,
 			chainKey[:],
-			handshake.presharedKey[:],
+			combinedKey[:], // TODO aparcar zero
 		)
 		mixHash(&hash, &hash, tau[:])
 
@@ -598,6 +756,468 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 
 	// update handshake state
 
+	handshake.mutex.Lock()
+
+	handshake.hash = hash
+	handshake.chainKey = chainKey
+	handshake.remoteIndex = msg.Sender
+	handshake.state = handshakeResponseConsumed
+
+	handshake.mutex.Unlock()
+
+	setZero(hash[:])
+	setZero(chainKey[:])
+
+	return lookup.peer
+}
+
+func (device *Device) CreateMessagePQCInitiation(peer *Peer) (*MessagePQCInitiation, error) {
+	device.staticIdentity.RLock()
+	defer device.staticIdentity.RUnlock()
+
+	handshake := &peer.handshake
+	handshake.mutex.Lock()
+	defer handshake.mutex.Unlock()
+
+	// === PART 1: Standard X25519 handshake initiation ===
+	// This creates the standard WireGuard fields (Ephemeral, Static, Timestamp)
+
+	// create ephemeral key
+	var err error
+	handshake.hash = InitialHash
+	handshake.chainKey = InitialChainKey
+	handshake.localEphemeral, err = newPrivateKey()
+	if err != nil {
+		return nil, err
+	}
+
+	handshake.mixHash(handshake.remoteStatic[:])
+
+	msg := &MessagePQCInitiation{
+		Type:      MessagePQCInitiationType,
+		Ephemeral: handshake.localEphemeral.publicKey(),
+	}
+
+	handshake.mixKey(msg.Ephemeral[:])
+	handshake.mixHash(msg.Ephemeral[:])
+
+	// encrypt static key
+	ss, err := handshake.localEphemeral.sharedSecret(handshake.remoteStatic)
+	if err != nil {
+		return nil, err
+	}
+	var key [chacha20poly1305.KeySize]byte
+	KDF2(
+		&handshake.chainKey,
+		&key,
+		handshake.chainKey[:],
+		ss[:],
+	)
+	aead, _ := chacha20poly1305.New(key[:])
+	aead.Seal(msg.Static[:0], ZeroNonce[:], device.staticIdentity.publicKey[:], handshake.hash[:])
+	handshake.mixHash(msg.Static[:])
+
+	// encrypt timestamp
+	if isZero(handshake.precomputedStaticStatic[:]) {
+		return nil, errInvalidPublicKey
+	}
+	KDF2(
+		&handshake.chainKey,
+		&key,
+		handshake.chainKey[:],
+		handshake.precomputedStaticStatic[:],
+	)
+	timestamp := tai64n.Now()
+	aead, _ = chacha20poly1305.New(key[:])
+	aead.Seal(msg.Timestamp[:0], ZeroNonce[:], timestamp[:], handshake.hash[:])
+	handshake.mixHash(msg.Timestamp[:])
+
+	// === PART 2: PQC extension fields ===
+	// Append ML-KEM-768 fields for hybrid security
+
+	localPQCStatic := device.staticIdentity.pqcPublicKey
+
+	// Build PQC Msg1 with timestamp bound to PQC transcript for hybrid protection
+	ctss, ei, encSI, eiPriv, ks, err := BuildPQCMsg1(localPQCStatic, handshake.remotePQCStatic, timestamp)
+	if err != nil {
+		return nil, fmt.Errorf("BuildPQCMsg1 failed: %w", err)
+	}
+
+	// Store ephemeral private key and key schedule for later
+	handshake.pqcEphemeralPrivate = eiPriv
+	handshake.pqcKeySchedule = ks
+
+	// Add PQC fields to message
+	msg.CTss = ctss
+	msg.EI = ei
+	copy(msg.EncSI[:], encSI)
+
+	// Assign index
+	device.indexTable.Delete(handshake.localIndex)
+	msg.Sender, err = device.indexTable.NewIndexForHandshake(peer, handshake)
+	if err != nil {
+		return nil, err
+	}
+	handshake.localIndex = msg.Sender
+
+	handshake.state = handshakeInitiationCreated
+	return msg, nil
+}
+
+func (device *Device) ConsumeMessagePQCInitiation(msg *MessagePQCInitiation, endpoint conn.Endpoint) *Peer {
+	var (
+		hash     [blake2s.Size]byte
+		chainKey [blake2s.Size]byte
+	)
+
+	if msg.Type != MessagePQCInitiationType {
+		return nil
+	}
+
+	device.staticIdentity.RLock()
+	defer device.staticIdentity.RUnlock()
+
+	// === PART 1: Process standard X25519 handshake initiation ===
+	// This validates the standard WireGuard fields
+
+	mixHash(&hash, &InitialHash, device.staticIdentity.publicKey[:])
+	mixHash(&hash, &hash, msg.Ephemeral[:])
+	mixKey(&chainKey, &InitialChainKey, msg.Ephemeral[:])
+
+	// decrypt static key
+	var peerPK NoisePublicKey
+	var key [chacha20poly1305.KeySize]byte
+	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+	if err != nil {
+		return nil
+	}
+	KDF2(&chainKey, &key, chainKey[:], ss[:])
+	aead, _ := chacha20poly1305.New(key[:])
+	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
+	if err != nil {
+		return nil
+	}
+	mixHash(&hash, &hash, msg.Static[:])
+
+	// lookup peer by X25519 key
+	initEP, ok := endpoint.(conn.InitiationAwareEndpoint)
+	if ok {
+		initEP.InitiationMessagePublicKey(peerPK)
+	}
+
+	peer := device.LookupPeer(peerPK)
+	if peer == nil || !peer.isRunning.Load() {
+		return nil
+	}
+
+	handshake := &peer.handshake
+
+	// verify identity and decrypt timestamp
+	var timestamp tai64n.Timestamp
+
+	handshake.mutex.RLock()
+
+	if isZero(handshake.precomputedStaticStatic[:]) {
+		handshake.mutex.RUnlock()
+		return nil
+	}
+	KDF2(
+		&chainKey,
+		&key,
+		chainKey[:],
+		handshake.precomputedStaticStatic[:],
+	)
+	aead, _ = chacha20poly1305.New(key[:])
+	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
+	if err != nil {
+		handshake.mutex.RUnlock()
+		return nil
+	}
+	mixHash(&hash, &hash, msg.Timestamp[:])
+
+	// TODO aparcar move after PQC validation
+	// protect against replay & flood
+	replay := !timestamp.After(handshake.lastTimestamp)
+	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
+	handshake.mutex.RUnlock()
+	if replay {
+		device.log.Verbosef("%v - ConsumeMessagePQCInitiation: handshake replay @ %v", peer, timestamp)
+		return nil
+	}
+	if flood {
+		device.log.Verbosef("%v - ConsumeMessagePQCInitiation: handshake flood", peer)
+		return nil
+	}
+
+	// === PART 2: Process PQC extension fields ===
+	// This validates the ML-KEM-768 fields for hybrid security
+
+	localPQCStatic := device.staticIdentity.pqcPublicKey
+	localPQCPrivateSeed := device.staticIdentity.pqcSeed
+
+	device.log.Errorf("ConsumeMessagePQCInitiation: Processing PQC Msg1 with localPQCStatic len=%d", len(localPQCStatic))
+	// Pass timestamp to PQC processing for hybrid protection
+	// This binds the timestamp to the PQC transcript, ensuring an attacker must
+	// break both X25519 AND ML-KEM-768 to forge timestamps
+	initiatorStaticPub, ks, err := ProcessPQCMsg1(
+		localPQCStatic,
+		localPQCPrivateSeed,
+		msg.CTss,
+		msg.EI,
+		msg.EncSI[:],
+		timestamp,
+	)
+	if err != nil {
+		device.log.Errorf("ProcessPQCMsg1 failed: %v", err)
+		return nil
+	}
+
+	device.log.Errorf("ConsumeMessagePQCInitiation: Successfully decrypted initiator static key, len=%d", len(initiatorStaticPub))
+
+	// Verify PQC key matches the peer we found via X25519
+	if !bytes.Equal(initiatorStaticPub[:], handshake.remotePQCStatic[:]) {
+		device.log.Errorf("%v - ConsumeMessagePQCInitiation: PQC key mismatch!", peer)
+		return nil
+	}
+
+	device.log.Errorf("%v - ConsumeMessagePQCInitiation: Both X25519 and PQC validation passed", peer)
+
+	// Update handshake state with both X25519 and PQC data
+	handshake.mutex.Lock()
+
+	// Standard X25519 state
+	handshake.hash = hash
+	handshake.chainKey = chainKey
+	handshake.remoteIndex = msg.Sender
+	handshake.remoteEphemeral = msg.Ephemeral
+	if timestamp.After(handshake.lastTimestamp) {
+		handshake.lastTimestamp = timestamp
+	}
+	now := time.Now()
+	if now.After(handshake.lastInitiationConsumption) {
+		handshake.lastInitiationConsumption = now
+	}
+
+	// PQC state
+	handshake.pqcKeySchedule = ks
+	handshake.pqcRemoteEphemeral = msg.EI
+
+	handshake.state = handshakeInitiationConsumed
+	handshake.mutex.Unlock()
+
+	setZero(hash[:])
+	setZero(chainKey[:])
+
+	return peer
+}
+
+func (device *Device) CreateMessagePQCResponse(peer *Peer) (*MessagePQCResponse, error) {
+	handshake := &peer.handshake
+	handshake.mutex.Lock()
+	defer handshake.mutex.Unlock()
+
+	if handshake.state != handshakeInitiationConsumed {
+		return nil, errors.New("handshake initiation must be consumed first")
+	}
+
+	if handshake.pqcKeySchedule == nil {
+		return nil, errors.New("PQC key schedule not initialized")
+	}
+
+	// === PART 1: Standard X25519 response ===
+
+	// assign index
+	var err error
+	device.indexTable.Delete(handshake.localIndex)
+	handshake.localIndex, err = device.indexTable.NewIndexForHandshake(peer, handshake)
+	if err != nil {
+		return nil, err
+	}
+
+	msg := &MessagePQCResponse{
+		Type:     MessagePQCResponseType,
+		Sender:   handshake.localIndex,
+		Receiver: handshake.remoteIndex,
+	}
+
+	// create ephemeral key
+	handshake.localEphemeral, err = newPrivateKey()
+	if err != nil {
+		return nil, err
+	}
+	msg.Ephemeral = handshake.localEphemeral.publicKey()
+	handshake.mixHash(msg.Ephemeral[:])
+	handshake.mixKey(msg.Ephemeral[:])
+
+	ss, err := handshake.localEphemeral.sharedSecret(handshake.remoteEphemeral)
+	if err != nil {
+		return nil, err
+	}
+	handshake.mixKey(ss[:])
+	ss, err = handshake.localEphemeral.sharedSecret(handshake.remoteStatic)
+	if err != nil {
+		return nil, err
+	}
+	handshake.mixKey(ss[:])
+
+	// === PART 2: PQC extension fields ===
+
+	// Build PQC Msg2
+	ctee, ctse, psk, err := BuildPQCMsg2(
+		handshake.pqcRemoteEphemeral,
+		handshake.remotePQCStatic,
+		handshake.pqcKeySchedule,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("BuildPQCMsg2 failed: %w", err)
+	}
+
+	// Store PQC-derived key
+	handshake.pqcKey = psk
+
+	// Add PQC fields to message
+	msg.CTee = ctee
+	msg.CTse = ctse
+
+	// === PART 3: Combine with preshared key ===
+	// Add combined preshared key (user PSK XOR PQC key)
+
+	var tau [blake2s.Size]byte
+	var key [chacha20poly1305.KeySize]byte
+
+	// Combine PSK and PQC key via XOR
+	var combinedKey NoisePresharedKey
+	for i := range combinedKey {
+		combinedKey[i] = handshake.presharedKey[i] ^ handshake.pqcKey[i]
+	}
+
+	KDF3(
+		&handshake.chainKey,
+		&tau,
+		&key,
+		handshake.chainKey[:],
+		combinedKey[:],
+	)
+
+	handshake.mixHash(tau[:])
+
+	aead, _ := chacha20poly1305.New(key[:])
+	aead.Seal(msg.Empty[:0], ZeroNonce[:], nil, handshake.hash[:])
+	handshake.mixHash(msg.Empty[:])
+
+	handshake.state = handshakeResponseCreated
+	return msg, nil
+}
+
+func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
+	if msg.Type != MessagePQCResponseType {
+		return nil
+	}
+
+	// Lookup handshake by receiver
+	lookup := device.indexTable.Lookup(msg.Receiver)
+	handshake := lookup.handshake
+	if handshake == nil {
+		return nil
+	}
+
+	var (
+		hash     [blake2s.Size]byte
+		chainKey [blake2s.Size]byte
+	)
+
+	ok := func() bool {
+		// lock handshake state
+		handshake.mutex.RLock()
+		defer handshake.mutex.RUnlock()
+
+		if handshake.state != handshakeInitiationCreated {
+			return false
+		}
+
+		if handshake.pqcKeySchedule == nil {
+			return false
+		}
+
+		// lock private key for reading
+		device.staticIdentity.RLock()
+		defer device.staticIdentity.RUnlock()
+
+		// === PART 1: Process standard X25519 response ===
+
+		// finish 3-way DH
+		mixHash(&hash, &handshake.hash, msg.Ephemeral[:])
+		mixKey(&chainKey, &handshake.chainKey, msg.Ephemeral[:])
+
+		ss, err := handshake.localEphemeral.sharedSecret(msg.Ephemeral)
+		if err != nil {
+			return false
+		}
+		mixKey(&chainKey, &chainKey, ss[:])
+		setZero(ss[:])
+
+		ss, err = device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+		if err != nil {
+			return false
+		}
+		mixKey(&chainKey, &chainKey, ss[:])
+		setZero(ss[:])
+
+		// === PART 2: Process PQC extension fields ===
+
+		localPQCPrivateSeed := device.staticIdentity.pqcSeed
+
+		// Process PQC Msg2
+		psk, err := ProcessPQCMsg2(
+			handshake.pqcEphemeralPrivate,
+			localPQCPrivateSeed,
+			msg.CTee,
+			msg.CTse,
+			handshake.pqcKeySchedule,
+		)
+		if err != nil {
+			return false
+		}
+
+		// Store PQC-derived key temporarily (will be committed if validation passes)
+		// We need to store it now because it's used in the combined key below
+		handshake.pqcKey = psk
+
+		// === PART 3: Validate with combined preshared key ===
+		// Combine preshared key (user PSK XOR PQC key)
+
+		// Always XOR both keys to avoid timing attacks
+		var combinedKey NoisePresharedKey
+		for i := range combinedKey {
+			combinedKey[i] = handshake.presharedKey[i] ^ handshake.pqcKey[i]
+		}
+
+		var tau [blake2s.Size]byte
+		var key [chacha20poly1305.KeySize]byte
+		KDF3(
+			&chainKey,
+			&tau,
+			&key,
+			chainKey[:],
+			combinedKey[:],
+		)
+		mixHash(&hash, &hash, tau[:])
+
+		// authenticate transcript
+		aead, _ := chacha20poly1305.New(key[:])
+		_, err = aead.Open(nil, ZeroNonce[:], msg.Empty[:], hash[:])
+		if err != nil {
+			return false
+		}
+		mixHash(&hash, &hash, msg.Empty[:])
+		return true
+	}()
+
+	if !ok {
+		return nil
+	}
+
+	// update handshake state
 	handshake.mutex.Lock()
 
 	handshake.hash = hash

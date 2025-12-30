@@ -202,8 +202,22 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					continue
 				}
 
+			case MessagePQCInitiationType:
+				if len(packet) != MessagePQCInitiationSize {
+					device.log.Errorf("Received PQC initiation with wrong size: got %d, expected %d", len(packet), MessagePQCInitiationSize)
+					continue
+				}
+				device.log.Verbosef("Received PQC initiation message (size: %d)", len(packet))
+
+			case MessagePQCResponseType:
+				if len(packet) != MessagePQCResponseSize {
+					device.log.Errorf("Received PQC response with wrong size: got %d, expected %d", len(packet), MessagePQCResponseSize)
+					continue
+				}
+				device.log.Verbosef("Received PQC response message (size: %d)", len(packet))
+
 			default:
-				device.log.Verbosef("Received message with unknown type")
+				device.log.Verbosef("Received message with unknown type: %d", msgType)
 				continue
 			}
 
@@ -311,7 +325,7 @@ func (device *Device) RoutineHandshake(id int) {
 
 			goto skip
 
-		case MessageInitiationType, MessageResponseType:
+		case MessageInitiationType, MessageResponseType, MessagePQCInitiationType, MessagePQCResponseType:
 
 			// check mac fields and maybe ratelimit
 
@@ -412,6 +426,75 @@ func (device *Device) RoutineHandshake(id int) {
 
 			err = peer.BeginSymmetricSession()
 
+			if err != nil {
+				device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
+				goto skip
+			}
+
+			peer.timersSessionDerived()
+			peer.timersHandshakeComplete()
+			peer.SendKeepalive()
+
+		case MessagePQCInitiationType:
+			device.log.Errorf("Processing PQC initiation message")
+
+			// unmarshal
+			var msg MessagePQCInitiation
+			err := msg.unmarshal(elem.packet)
+			if err != nil {
+				device.log.Errorf("Failed to decode PQC initiation message: %v", err)
+				goto skip
+			}
+
+			// consume initiation
+			peer := device.ConsumeMessagePQCInitiation(&msg, elem.endpoint)
+			if peer == nil {
+				// Silently drop - could be a race condition during peer setup or invalid message
+				goto skip
+			}
+
+			// update timers
+			peer.timersAnyAuthenticatedPacketTraversal()
+			peer.timersAnyAuthenticatedPacketReceived()
+
+			// update endpoint
+			peer.SetEndpointFromPacket(elem.endpoint)
+
+			device.log.Errorf("%v - Received PQC handshake initiation", peer)
+			peer.rxBytes.Add(uint64(len(elem.packet)))
+
+			peer.SendHandshakePQCResponse()
+
+		case MessagePQCResponseType:
+			device.log.Errorf("Processing PQC response message")
+
+			// unmarshal
+			var msg MessagePQCResponse
+			err := msg.unmarshal(elem.packet)
+			if err != nil {
+				device.log.Errorf("Failed to decode PQC response message: %v", err)
+				goto skip
+			}
+
+			// consume response
+			peer := device.ConsumeMessagePQCResponse(&msg)
+			if peer == nil {
+				device.log.Errorf("Received invalid PQC response message from %s", elem.endpoint.DstToString())
+				goto skip
+			}
+
+			// update endpoint
+			peer.SetEndpointFromPacket(elem.endpoint)
+
+			device.log.Errorf("%v - Received PQC handshake response", peer)
+			peer.rxBytes.Add(uint64(len(elem.packet)))
+
+			// update timers
+			peer.timersAnyAuthenticatedPacketTraversal()
+			peer.timersAnyAuthenticatedPacketReceived()
+
+			// derive keypair
+			err = peer.BeginSymmetricSession()
 			if err != nil {
 				device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
 				goto skip

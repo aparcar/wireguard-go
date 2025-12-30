@@ -1,0 +1,2770 @@
+commit 9bed5b79c80272445dcafe8e6aef8e6ed9f545b9
+Author: Paul Spooren <mail@aparcar.org>
+Date:   Sun Dec 28 03:37:01 2025 +0100
+
+    pqc handshake
+
+    Signed-off-by: Paul Spooren <mail@aparcar.org>
+
+diff --git a/cmd/wg-pqc/main.go b/cmd/wg-pqc/main.go
+new file mode 100644
+index 0000000..b0049e5
+--- /dev/null
++++ b/cmd/wg-pqc/main.go
+@@ -0,0 +1,453 @@
++// SPDX-License-Identifier: MIT
++
++package main
++
++import (
++	"bufio"
++	"encoding/base64"
++	"encoding/hex"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"strings"
++
++	"github.com/tailscale/wireguard-go/device"
++)
++
++func printUsage() {
++	fmt.Fprintf(os.Stderr, "Usage: %s <command> [arguments]\n", os.Args[0])
++	fmt.Fprintf(os.Stderr, "\nCommands:\n")
++	fmt.Fprintf(os.Stderr, "  genkey                              Generate a new PQC private key (seed)\n")
++	fmt.Fprintf(os.Stderr, "  pubkey                              Derive the public key from a private key (reads from stdin)\n")
++	fmt.Fprintf(os.Stderr, "  set <interface> [options]           Configure PQC keys for an interface\n")
++	fmt.Fprintf(os.Stderr, "  show <interface> [peer]             Show PQC configuration for an interface\n")
++	fmt.Fprintf(os.Stderr, "  get <interface>                     Get raw UAPI configuration (for debugging)\n")
++	fmt.Fprintf(os.Stderr, "\nSet command options:\n")
++	fmt.Fprintf(os.Stderr, "  pqc-private-key <file>              Set device PQC private key from file\n")
++	fmt.Fprintf(os.Stderr, "  peer <public-key>                   Specify peer by WireGuard public key (base64)\n")
++	fmt.Fprintf(os.Stderr, "  pqc-public-key <base64-key>         Set peer's PQC public key (base64)\n")
++	fmt.Fprintf(os.Stderr, "\nExamples:\n")
++	fmt.Fprintf(os.Stderr, "  # Generate a new private key\n")
++	fmt.Fprintf(os.Stderr, "  %s genkey > private.key\n", os.Args[0])
++	fmt.Fprintf(os.Stderr, "\n  # Derive the public key from a private key\n")
++	fmt.Fprintf(os.Stderr, "  %s pubkey < private.key > public.key\n", os.Args[0])
++	fmt.Fprintf(os.Stderr, "\n  # Generate both in one go\n")
++	fmt.Fprintf(os.Stderr, "  %s genkey | tee private.key | %s pubkey > public.key\n", os.Args[0], os.Args[0])
++	fmt.Fprintf(os.Stderr, "\n  # Set device PQC private key\n")
++	fmt.Fprintf(os.Stderr, "  %s set wg0 pqc-private-key pqc-private.key\n", os.Args[0])
++	fmt.Fprintf(os.Stderr, "\n  # Set peer's PQC public key\n")
++	fmt.Fprintf(os.Stderr, "  %s set wg0 peer <base64-wg-pubkey> pqc-public-key <base64-pqc-pubkey>\n", os.Args[0])
++	fmt.Fprintf(os.Stderr, "\n  # Show PQC status\n")
++	fmt.Fprintf(os.Stderr, "  %s show wg0\n", os.Args[0])
++	fmt.Fprintf(os.Stderr, "\nKey Format:\n")
++	fmt.Fprintf(os.Stderr, "  Private key (seed): 64 bytes base64-encoded\n")
++	fmt.Fprintf(os.Stderr, "  Public key:         1184 bytes base64-encoded\n")
++}
++
++func genkey() error {
++	// Generate only the seed (private key)
++	seedHex, _, err := device.GeneratePQCKeypair()
++	if err != nil {
++		return fmt.Errorf("failed to generate PQC keypair: %w", err)
++	}
++
++	// Convert hex to bytes
++	seedBytes, err := hex.DecodeString(seedHex)
++	if err != nil {
++		return fmt.Errorf("failed to decode seed: %w", err)
++	}
++
++	// Output as base64 (like wg genkey)
++	fmt.Println(base64.StdEncoding.EncodeToString(seedBytes))
++	return nil
++}
++
++func pubkey() error {
++	// Read the seed from stdin
++	reader := bufio.NewReader(os.Stdin)
++	input, err := reader.ReadString('\n')
++	if err != nil && err != io.EOF {
++		return fmt.Errorf("failed to read from stdin: %w", err)
++	}
++
++	// Trim whitespace
++	seedBase64 := strings.TrimSpace(input)
++
++	// Decode base64 to bytes
++	seedBytes, err := base64.StdEncoding.DecodeString(seedBase64)
++	if err != nil {
++		return fmt.Errorf("failed to decode base64 seed: %w", err)
++	}
++
++	// Validate seed length (64 bytes)
++	if len(seedBytes) != 64 {
++		return fmt.Errorf("invalid seed length: expected 64 bytes, got %d", len(seedBytes))
++	}
++
++	// Convert to hex for internal use
++	seedHex := hex.EncodeToString(seedBytes)
++
++	// Parse the seed
++	seed, err := device.ParsePQCSeedHex(seedHex)
++	if err != nil {
++		return fmt.Errorf("failed to parse seed: %w", err)
++	}
++
++	// Derive the public key
++	publicKey, err := device.PQCPublicKeyFromSeed(seed)
++	if err != nil {
++		return fmt.Errorf("failed to derive public key: %w", err)
++	}
++
++	// Output the public key as base64
++	fmt.Println(base64.StdEncoding.EncodeToString(publicKey[:]))
++	return nil
++}
++
++func sendUAPICommand(sockPath, command string) error {
++	// Connect to UAPI socket
++	conn, err := net.Dial("unix", sockPath)
++	if err != nil {
++		return fmt.Errorf("failed to connect to UAPI socket: %w", err)
++	}
++	defer conn.Close()
++
++	// Send command
++	_, err = conn.Write([]byte(command))
++	if err != nil {
++		return fmt.Errorf("failed to send UAPI command: %w", err)
++	}
++
++	// Read response
++	reader := bufio.NewReader(conn)
++	response, err := reader.ReadString('\n')
++	if err != nil && err != io.EOF {
++		return fmt.Errorf("failed to read UAPI response: %w", err)
++	}
++
++	// Check for errors
++	if strings.HasPrefix(response, "errno=") && !strings.HasPrefix(response, "errno=0") {
++		return fmt.Errorf("UAPI error: %s", strings.TrimSpace(response))
++	}
++
++	return nil
++}
++
++func setCommand(args []string) error {
++	if len(args) < 1 {
++		return fmt.Errorf("missing interface name")
++	}
++
++	iface := args[0]
++	args = args[1:]
++
++	// Build UAPI socket path
++	sockPath := fmt.Sprintf("/var/run/wireguard/%s.sock", iface)
++
++	// Parse arguments
++	var commands []string
++	commands = append(commands, "set=1")
++
++	var currentPeer string
++
++	for i := 0; i < len(args); i++ {
++		arg := args[i]
++
++		switch arg {
++		case "pqc-private-key":
++			if i+1 >= len(args) {
++				return fmt.Errorf("missing value for pqc-private-key")
++			}
++			i++
++			keyFile := args[i]
++
++			// Read private key from file
++			data, err := os.ReadFile(keyFile)
++			if err != nil {
++				return fmt.Errorf("failed to read private PQC key file: %w", err)
++			}
++
++			seedBase64 := strings.TrimSpace(string(data))
++
++			// Decode base64 to bytes
++			seedBytes, err := base64.StdEncoding.DecodeString(seedBase64)
++			if err != nil {
++				return fmt.Errorf("failed to decode base64 private key: %w", err)
++			}
++
++			if len(seedBytes) != 64 {
++				return fmt.Errorf("invalid private PQC key length: expected 64 bytes, got %d", len(seedBytes))
++			}
++
++			// Convert to hex for UAPI
++			seedHex := hex.EncodeToString(seedBytes)
++			commands = append(commands, fmt.Sprintf("pqc_private_key=%s", seedHex))
++
++		case "peer":
++			if i+1 >= len(args) {
++				return fmt.Errorf("missing value for peer")
++			}
++			i++
++			peerKey := args[i]
++
++			// Convert base64 WireGuard public key to hex
++			// This is needed for UAPI
++			var noiseKey device.NoisePublicKey
++			if err := noiseKey.FromHex(peerKey); err != nil {
++				// Try base64 decode and convert to hex
++				pubKeyBytes, err := hex.DecodeString(peerKey)
++				if err != nil {
++					return fmt.Errorf("invalid peer public key: %w", err)
++				}
++				if len(pubKeyBytes) != 32 {
++					return fmt.Errorf("invalid peer public key length: expected 32 bytes")
++				}
++				peerKey = hex.EncodeToString(pubKeyBytes)
++			} else {
++				peerKey = hex.EncodeToString(noiseKey[:])
++			}
++
++			currentPeer = peerKey
++			commands = append(commands, fmt.Sprintf("public_key=%s", peerKey))
++
++		case "pqc-public-key":
++			if i+1 >= len(args) {
++				return fmt.Errorf("missing value for pqc-public-key")
++			}
++			if currentPeer == "" {
++				return fmt.Errorf("pqc-public-key must be used after peer")
++			}
++			i++
++			pqcPubKeyBase64 := args[i]
++
++			// Decode base64 to bytes
++			pqcPubKeyBytes, err := base64.StdEncoding.DecodeString(pqcPubKeyBase64)
++			if err != nil {
++				return fmt.Errorf("failed to decode base64 PQC public key: %w", err)
++			}
++
++			// Validate PQC public key length (1184 bytes)
++			if len(pqcPubKeyBytes) != 1184 {
++				return fmt.Errorf("invalid PQC public key length: expected 1184 bytes, got %d", len(pqcPubKeyBytes))
++			}
++
++			// Convert to hex for UAPI
++			pqcPubKeyHex := hex.EncodeToString(pqcPubKeyBytes)
++			commands = append(commands, fmt.Sprintf("pqc_public_key=%s", pqcPubKeyHex))
++
++		default:
++			return fmt.Errorf("unknown option: %s", arg)
++		}
++	}
++
++	// Build final command
++	command := strings.Join(commands, "\n") + "\n\n"
++
++	// Send to UAPI
++	if err := sendUAPICommand(sockPath, command); err != nil {
++		return err
++	}
++
++	fmt.Printf("Successfully configured PQC keys for interface %s\n", iface)
++	return nil
++}
++
++func getCommand(args []string) error {
++	if len(args) < 1 {
++		return fmt.Errorf("missing interface name")
++	}
++
++	iface := args[0]
++
++	// Build UAPI socket path
++	sockPath := fmt.Sprintf("/var/run/wireguard/%s.sock", iface)
++
++	// Connect to UAPI socket
++	conn, err := net.Dial("unix", sockPath)
++	if err != nil {
++		return fmt.Errorf("failed to connect to UAPI socket: %w", err)
++	}
++	defer conn.Close()
++
++	// Send get command
++	_, err = conn.Write([]byte("get=1\n\n"))
++	if err != nil {
++		return fmt.Errorf("failed to send get command: %w", err)
++	}
++
++	// Read full response
++	reader := bufio.NewReader(conn)
++	var response strings.Builder
++	for {
++		line, err := reader.ReadString('\n')
++		if err != nil {
++			if err == io.EOF {
++				break
++			}
++			return fmt.Errorf("failed to read response: %w", err)
++		}
++		response.WriteString(line)
++		// UAPI responses end with an empty line
++		if line == "\n" || line == "errno=0\n" {
++			break
++		}
++	}
++
++	// Output the full response
++	fmt.Print(response.String())
++	return nil
++}
++
++func showCommand(args []string) error {
++	if len(args) < 1 {
++		return fmt.Errorf("missing interface name")
++	}
++
++	iface := args[0]
++
++	// Build UAPI socket path
++	sockPath := fmt.Sprintf("/var/run/wireguard/%s.sock", iface)
++
++	// Connect to UAPI socket
++	conn, err := net.Dial("unix", sockPath)
++	if err != nil {
++		return fmt.Errorf("failed to connect to UAPI socket: %w", err)
++	}
++	defer conn.Close()
++
++	// Send get command
++	_, err = conn.Write([]byte("get=1\n\n"))
++	if err != nil {
++		return fmt.Errorf("failed to send get command: %w", err)
++	}
++
++	// Read and parse UAPI response
++	reader := bufio.NewReader(conn)
++	var devicePQCPubKey string
++	type PeerInfo struct {
++		publicKey    string
++		pqcPublicKey string
++	}
++	var peers []PeerInfo
++	var currentPeer *PeerInfo
++
++	for {
++		line, err := reader.ReadString('\n')
++		if err != nil {
++			if err == io.EOF {
++				break
++			}
++			return fmt.Errorf("failed to read response: %w", err)
++		}
++
++		line = strings.TrimSpace(line)
++		if line == "" || line == "errno=0" {
++			break
++		}
++
++		parts := strings.SplitN(line, "=", 2)
++		if len(parts) != 2 {
++			continue
++		}
++
++		key, value := parts[0], parts[1]
++
++		switch key {
++		case "pqc_public_key":
++			if currentPeer == nil {
++				// Device PQC public key
++				devicePQCPubKey = value
++			} else {
++				// Peer PQC public key
++				currentPeer.pqcPublicKey = value
++			}
++		case "public_key":
++			// New peer
++			if currentPeer != nil {
++				peers = append(peers, *currentPeer)
++			}
++			currentPeer = &PeerInfo{publicKey: value}
++		}
++	}
++
++	// Add last peer if exists
++	if currentPeer != nil {
++		peers = append(peers, *currentPeer)
++	}
++
++	// Display output in wg-like format
++	fmt.Printf("interface: %s\n", iface)
++
++	if devicePQCPubKey != "" && devicePQCPubKey != strings.Repeat("0", len(devicePQCPubKey)) {
++		// Show first 8 hex chars (4 bytes)
++		preview := devicePQCPubKey
++		if len(preview) > 8 {
++			preview = preview[:8] + "…"
++		}
++		fmt.Printf("  pqc public key: %s\n", preview)
++	} else {
++		fmt.Printf("  pqc: not configured\n")
++	}
++
++	for _, peer := range peers {
++		// Convert hex to base64 for display
++		pubKeyBytes, _ := hex.DecodeString(peer.publicKey)
++		pubKeyB64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
++
++		fmt.Printf("\npeer: %s\n", pubKeyB64)
++
++		if peer.pqcPublicKey != "" && peer.pqcPublicKey != strings.Repeat("0", len(peer.pqcPublicKey)) {
++			// Show first 8 hex chars (4 bytes)
++			preview := peer.pqcPublicKey
++			if len(preview) > 8 {
++				preview = preview[:8] + "…"
++			}
++			fmt.Printf("  pqc public key: %s\n", preview)
++		} else {
++			fmt.Printf("  pqc: not configured\n")
++		}
++	}
++
++	return nil
++}
++
++func main() {
++	// Parse command
++	if len(os.Args) < 2 {
++		printUsage()
++		os.Exit(1)
++	}
++
++	command := os.Args[1]
++
++	// Handle help flags
++	if command == "-h" || command == "--help" || command == "help" {
++		printUsage()
++		os.Exit(0)
++	}
++
++	// Execute command
++	var err error
++	switch command {
++	case "genkey":
++		err = genkey()
++	case "pubkey":
++		err = pubkey()
++	case "set":
++		err = setCommand(os.Args[2:])
++	case "show":
++		err = showCommand(os.Args[2:])
++	case "get":
++		err = getCommand(os.Args[2:])
++	default:
++		fmt.Fprintf(os.Stderr, "Error: unknown command '%s'\n\n", command)
++		printUsage()
++		os.Exit(1)
++	}
++
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
++		os.Exit(1)
++	}
++}
+diff --git a/device/device.go b/device/device.go
+index 2b97608..62e6b14 100644
+--- a/device/device.go
++++ b/device/device.go
+@@ -53,6 +53,9 @@ type Device struct {
+ 		sync.RWMutex
+ 		privateKey NoisePrivateKey
+ 		publicKey  NoisePublicKey
++		// PQC (Post-Quantum Cryptography) keys for ML-KEM-768
++		pqcSeed      NoisePQCSeed
++		pqcPublicKey NoisePQCPublicKey
+ 	}
+
+ 	peers struct {
+@@ -284,6 +287,56 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
+ 	return nil
+ }
+
++// SetPQCSeed sets the device's PQC (ML-KEM-768) seed for post-quantum handshakes.
++// The corresponding public key is derived automatically.
++func (device *Device) SetPQCSeed(seed NoisePQCSeed) error {
++	device.staticIdentity.Lock()
++	defer device.staticIdentity.Unlock()
++
++	if seed.Equals(device.staticIdentity.pqcSeed) {
++		return nil
++	}
++
++	// Derive the public key from the seed (we don't need the decapsulation key here)
++	pub, _, err := PQCGenerateKeyPairFromSeed(seed)
++	if err != nil {
++		return err
++	}
++
++	device.staticIdentity.pqcSeed = seed
++	device.staticIdentity.pqcPublicKey = pub
++
++	device.log.Verbosef("PQC seed set, public key derived")
++
++	return nil
++}
++
++// GetPQCPublicKey returns the device's PQC public key.
++func (device *Device) GetPQCPublicKey() NoisePQCPublicKey {
++	device.staticIdentity.RLock()
++	defer device.staticIdentity.RUnlock()
++	return device.staticIdentity.pqcPublicKey
++}
++
++// GeneratePQCKeyPair generates a new random PQC key pair for the device.
++// The seed and public key are stored in the device's static identity.
++func (device *Device) GeneratePQCKeyPair() error {
++	device.staticIdentity.Lock()
++	defer device.staticIdentity.Unlock()
++
++	pub, seed, err := PQCGenerateKeyPair()
++	if err != nil {
++		return err
++	}
++
++	device.staticIdentity.pqcSeed = seed
++	device.staticIdentity.pqcPublicKey = pub
++
++	device.log.Verbosef("Generated new PQC key pair")
++
++	return nil
++}
++
+ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
+ 	device := new(Device)
+ 	device.state.state.Store(uint32(deviceStateDown))
+@@ -396,6 +449,26 @@ func (device *Device) LookupActivePeer(pk NoisePublicKey) (_ *Peer, ok bool) {
+ 	return p, ok
+ }
+
++// LookupPeerByPQCKey looks up a peer by its PQC public key.
++// Returns nil if no peer with this PQC key is found.
++func (device *Device) LookupPeerByPQCKey(pqcPK NoisePQCPublicKey) *Peer {
++	device.peers.RLock()
++	defer device.peers.RUnlock()
++
++	// Iterate through all peers to find matching PQC key
++	for _, peer := range device.peers.keyMap {
++		peer.handshake.mutex.RLock()
++		remotePQCStatic := peer.handshake.remotePQCStatic
++		peer.handshake.mutex.RUnlock()
++
++		if remotePQCStatic == pqcPK {
++			return peer
++		}
++	}
++
++	return nil
++}
++
+ var errAddExistingPeer = errors.New("adding existing peer")
+
+ func (device *Device) RemovePeer(key NoisePublicKey) {
+diff --git a/device/noise-pqc.go b/device/noise-pqc.go
+new file mode 100644
+index 0000000..1a260dd
+--- /dev/null
++++ b/device/noise-pqc.go
+@@ -0,0 +1,137 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
++ */
++
++package device
++
++import (
++	"crypto/mlkem"
++	"errors"
++
++	"golang.org/x/crypto/blake2s"
++)
++
++// PQCGenerateKeyPair generates a new ML-KEM-768 keypair.
++// Returns the public key (encapsulation key) and seed for the private key.
++func PQCGenerateKeyPair() (NoisePQCPublicKey, NoisePQCSeed, error) {
++	var pubKey NoisePQCPublicKey
++	var seed NoisePQCSeed
++
++	dk, err := mlkem.GenerateKey768()
++	if err != nil {
++		return pubKey, seed, err
++	}
++
++	// Get the encapsulation (public) key
++	ek := dk.EncapsulationKey()
++	ekBytes := ek.Bytes()
++	if len(ekBytes) != NoisePQCPublicKeySize {
++		return pubKey, seed, errors.New("unexpected encapsulation key size")
++	}
++	copy(pubKey[:], ekBytes)
++
++	// Get the seed (decapsulation key bytes)
++	seedBytes := dk.Bytes()
++	if len(seedBytes) != NoisePQCSeedSize {
++		return pubKey, seed, errors.New("unexpected seed size")
++	}
++	copy(seed[:], seedBytes)
++
++	return pubKey, seed, nil
++}
++
++// PQCGenerateKeyPairFromSeed generates a deterministic ML-KEM-768 keypair from a seed.
++// The seed must be exactly NoisePQCSeedSize bytes.
++func PQCGenerateKeyPairFromSeed(seed NoisePQCSeed) (NoisePQCPublicKey, *mlkem.DecapsulationKey768, error) {
++	var pubKey NoisePQCPublicKey
++
++	dk, err := mlkem.NewDecapsulationKey768(seed[:])
++	if err != nil {
++		return pubKey, nil, err
++	}
++
++	// Get the encapsulation (public) key
++	ek := dk.EncapsulationKey()
++	ekBytes := ek.Bytes()
++	if len(ekBytes) != NoisePQCPublicKeySize {
++		return pubKey, nil, errors.New("unexpected encapsulation key size")
++	}
++	copy(pubKey[:], ekBytes)
++
++	return pubKey, dk, nil
++}
++
++// PQCEncapsulate performs ML-KEM-768 encapsulation using the peer's public key.
++// Returns the shared secret and ciphertext.
++// The ciphertext should be sent to the peer who can decapsulate it with their private key.
++func PQCEncapsulate(peerPublicKey NoisePQCPublicKey) (NoisePQCSharedSecret, NoisePQCCiphertext, error) {
++	var sharedSecret NoisePQCSharedSecret
++	var ciphertext NoisePQCCiphertext
++
++	// Create encapsulation key from peer's public key bytes
++	ek, err := mlkem.NewEncapsulationKey768(peerPublicKey[:])
++	if err != nil {
++		return sharedSecret, ciphertext, err
++	}
++
++	// Encapsulate to get shared secret and ciphertext
++	ssBytes, ctBytes := ek.Encapsulate()
++
++	if len(ssBytes) != NoisePQCSharedSecretSize {
++		return sharedSecret, ciphertext, errors.New("unexpected shared secret size")
++	}
++	copy(sharedSecret[:], ssBytes)
++
++	if len(ctBytes) != NoisePQCCiphertextSize {
++		return sharedSecret, ciphertext, errors.New("unexpected ciphertext size")
++	}
++	copy(ciphertext[:], ctBytes)
++
++	return sharedSecret, ciphertext, nil
++}
++
++// PQCDecapsulate performs ML-KEM-768 decapsulation using our seed.
++// Returns the shared secret derived from the ciphertext.
++// This recovers the same shared secret that was generated during encapsulation.
++func PQCDecapsulate(seed NoisePQCSeed, ciphertext NoisePQCCiphertext) (NoisePQCSharedSecret, error) {
++	var sharedSecret NoisePQCSharedSecret
++
++	// Create decapsulation key from seed
++	dk, err := mlkem.NewDecapsulationKey768(seed[:])
++	if err != nil {
++		return sharedSecret, err
++	}
++
++	// Decapsulate to recover the shared secret
++	ssBytes, err := dk.Decapsulate(ciphertext[:])
++	if err != nil {
++		return sharedSecret, err
++	}
++
++	if len(ssBytes) != NoisePQCSharedSecretSize {
++		return sharedSecret, errors.New("unexpected shared secret size")
++	}
++	copy(sharedSecret[:], ssBytes)
++
++	return sharedSecret, nil
++}
++
++// PQCMixSecrets combines the classical ECDH shared secret with the PQC shared secret.
++// This is used to create a hybrid secret that is secure against both classical
++// and quantum attacks. The mixing uses HKDF with the Noise protocol's chaining key.
++//
++// The hybrid approach ensures that the resulting key is secure as long as
++// either the classical or the PQC key exchange is secure.
++func PQCMixSecrets(chainKey [blake2s.Size]byte, ecdhSecret, pqcSecret []byte) [blake2s.Size]byte {
++	// Use BLAKE2s as the mixing function, consistent with WireGuard's Noise implementation
++	// Mix: H(chainKey || ecdhSecret || pqcSecret)
++	h, _ := blake2s.New256(nil)
++	h.Write(chainKey[:])
++	h.Write(ecdhSecret)
++	h.Write(pqcSecret)
++
++	var result [blake2s.Size]byte
++	copy(result[:], h.Sum(nil))
++	return result
++}
+diff --git a/device/noise-protocol.go b/device/noise-protocol.go
+index ad5838e..b5bdb99 100644
+--- a/device/noise-protocol.go
++++ b/device/noise-protocol.go
+@@ -6,6 +6,7 @@
+ package device
+
+ import (
++	"bytes"
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+@@ -55,21 +56,25 @@ const (
+ )
+
+ const (
+-	MessageInitiationType  = 1
+-	MessageResponseType    = 2
+-	MessageCookieReplyType = 3
+-	MessageTransportType   = 4
++	MessageInitiationType    = 1
++	MessageResponseType      = 2
++	MessageCookieReplyType   = 3
++	MessageTransportType     = 4
++	MessagePQCInitiationType = 5
++	MessagePQCResponseType   = 6
+ )
+
+ const (
+-	MessageInitiationSize             = 148                                           // size of handshake initiation message
+-	MessageResponseSize               = 92                                            // size of response message
+-	MessageCookieReplySize            = 64                                            // size of cookie reply message
+-	MessageTransportHeaderSize        = 16                                            // size of data preceding content in transport message
+-	MessageEncapsulatingTransportSize = 8                                             // size of optional, free (for use by conn.Bind.Send()) space preceding the transport header
+-	MessageTransportSize              = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
+-	MessageKeepaliveSize              = MessageTransportSize                          // size of keepalive
+-	MessageHandshakeSize              = MessageInitiationSize                         // size of largest handshake related message
++	MessageInitiationSize             = 148                                                                                                      // size of handshake initiation message
++	MessageResponseSize               = 92                                                                                                       // size of response message
++	MessageCookieReplySize            = 64                                                                                                       // size of cookie reply message
++	MessageTransportHeaderSize        = 16                                                                                                       // size of data preceding content in transport message
++	MessageEncapsulatingTransportSize = 8                                                                                                        // size of optional, free (for use by conn.Bind.Send()) space preceding the transport header
++	MessageTransportSize              = MessageTransportHeaderSize + poly1305.TagSize                                                            // size of empty transport
++	MessageKeepaliveSize              = MessageTransportSize                                                                                     // size of keepalive
++	MessageHandshakeSize              = MessageInitiationSize                                                                                    // size of largest handshake related message
++	MessagePQCInitiationSize          = MessageInitiationSize + NoisePQCCiphertextSize + NoisePQCPublicKeySize + (NoisePQCPublicKeySize + poly1305.TagSize) // Standard initiation (148) + CTss(1088) + EI(1184) + EncSI(1200) = 3620 bytes
++	MessagePQCResponseSize            = MessageResponseSize + NoisePQCPublicKeySize + NoisePQCCiphertextSize + NoisePQCCiphertextSize            // Standard response (92) + + CTee(1088) + CTse(1088) = 2268 bytes
+ )
+
+ const (
+@@ -118,6 +123,44 @@ type MessageCookieReply struct {
+ 	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+ }
+
++// MessagePQCInitiation extends the standard MessageInitiation with PQC fields
++// Structure: [Standard Initiation Fields] + [PQC Extension Fields]
++// This allows hybrid X25519+ML-KEM-768 security
++type MessagePQCInitiation struct {
++	// Standard WireGuard initiation fields (reused for X25519 handshake)
++	Type      uint32
++	Sender    uint32
++	Ephemeral NoisePublicKey                             // X25519 ephemeral public key (32 bytes)
++	Static    [NoisePublicKeySize + poly1305.TagSize]byte // Encrypted X25519 static key (32 + 16 bytes)
++	Timestamp [tai64n.TimestampSize + poly1305.TagSize]byte // Encrypted timestamp (12 + 16 bytes)
++	MAC1      [blake2s.Size128]byte                      // MAC1 for standard part (16 bytes)
++	MAC2      [blake2s.Size128]byte                      // MAC2 for standard part (16 bytes)
++	
++	// PQC extension fields (appended after standard message)
++	CTss   NoisePQCCiphertext                             // ML-KEM-768 ciphertext from skem (1088 bytes)
++	EI     NoisePQCPublicKey                              // ML-KEM-768 ephemeral public key (1184 bytes)
++	EncSI  [NoisePQCPublicKeySize + poly1305.TagSize]byte // Encrypted ML-KEM-768 static key (1184 + 16 bytes)
++}
++
++// MessagePQCResponse extends the standard MessageResponse with PQC fields
++// Structure: [Standard Response Fields] + [PQC Extension Fields]
++// This allows hybrid X25519+ML-KEM-768 security
++type MessagePQCResponse struct {
++	// Standard WireGuard response fields (reused for X25519 handshake)
++	Type      uint32
++	Sender    uint32
++	Receiver  uint32
++	Ephemeral NoisePublicKey         // X25519 ephemeral public key (32 bytes)
++	Empty     [poly1305.TagSize]byte // Encrypted empty (16 bytes)
++	MAC1      [blake2s.Size128]byte  // MAC1 for standard part (16 bytes)
++	MAC2      [blake2s.Size128]byte  // MAC2 for standard part (16 bytes)
++	
++	// PQC extension fields (appended after standard message)
++	ER   NoisePQCPublicKey  // ML-KEM-768 responder ephemeral public key (1184 bytes)
++	CTee NoisePQCCiphertext // ML-KEM-768 ciphertext from ekem (1088 bytes)
++	CTse NoisePQCCiphertext // ML-KEM-768 ciphertext from skem (1088 bytes)
++}
++
+ var errMessageLengthMismatch = errors.New("message length mismatch")
+
+ func (msg *MessageInitiation) unmarshal(b []byte) error {
+@@ -210,12 +253,113 @@ func (msg *MessageCookieReply) marshal(b []byte) error {
+ 	return nil
+ }
+
++func (msg *MessagePQCInitiation) unmarshal(b []byte) error {
++	if len(b) != MessagePQCInitiationSize {
++		return errMessageLengthMismatch
++	}
++
++	// Unmarshal standard WireGuard initiation fields (first 148 bytes)
++	msg.Type = binary.LittleEndian.Uint32(b)
++	msg.Sender = binary.LittleEndian.Uint32(b[4:])
++	copy(msg.Ephemeral[:], b[8:])
++	copy(msg.Static[:], b[40:])
++	copy(msg.Timestamp[:], b[88:])
++	copy(msg.MAC1[:], b[116:])
++	copy(msg.MAC2[:], b[132:])
++	
++	// Unmarshal PQC extension fields (after standard 148 bytes)
++	offset := MessageInitiationSize
++	copy(msg.CTss[:], b[offset:])
++	offset += len(msg.CTss)
++	copy(msg.EI[:], b[offset:])
++	offset += len(msg.EI)
++	copy(msg.EncSI[:], b[offset:])
++
++	return nil
++}
++
++func (msg *MessagePQCInitiation) marshal(b []byte) error {
++	if len(b) != MessagePQCInitiationSize {
++		return errMessageLengthMismatch
++	}
++
++	// Marshal standard WireGuard initiation fields (first 148 bytes)
++	binary.LittleEndian.PutUint32(b, msg.Type)
++	binary.LittleEndian.PutUint32(b[4:], msg.Sender)
++	copy(b[8:], msg.Ephemeral[:])
++	copy(b[40:], msg.Static[:])
++	copy(b[88:], msg.Timestamp[:])
++	copy(b[116:], msg.MAC1[:])
++	copy(b[132:], msg.MAC2[:])
++	
++	// Marshal PQC extension fields (after standard 148 bytes)
++	offset := MessageInitiationSize
++	copy(b[offset:], msg.CTss[:])
++	offset += len(msg.CTss)
++	copy(b[offset:], msg.EI[:])
++	offset += len(msg.EI)
++	copy(b[offset:], msg.EncSI[:])
++
++	return nil
++}
++
++func (msg *MessagePQCResponse) unmarshal(b []byte) error {
++	if len(b) != MessagePQCResponseSize {
++		return errMessageLengthMismatch
++	}
++
++	// Unmarshal standard WireGuard response fields (first 92 bytes)
++	msg.Type = binary.LittleEndian.Uint32(b)
++	msg.Sender = binary.LittleEndian.Uint32(b[4:])
++	msg.Receiver = binary.LittleEndian.Uint32(b[8:])
++	copy(msg.Ephemeral[:], b[12:])
++	copy(msg.Empty[:], b[44:])
++	copy(msg.MAC1[:], b[60:])
++	copy(msg.MAC2[:], b[76:])
++	
++	// Unmarshal PQC extension fields (after standard 92 bytes)
++	offset := MessageResponseSize
++	copy(msg.ER[:], b[offset:])
++	offset += len(msg.ER)
++	copy(msg.CTee[:], b[offset:])
++	offset += len(msg.CTee)
++	copy(msg.CTse[:], b[offset:])
++
++	return nil
++}
++
++func (msg *MessagePQCResponse) marshal(b []byte) error {
++	if len(b) != MessagePQCResponseSize {
++		return errMessageLengthMismatch
++	}
++
++	// Marshal standard WireGuard response fields (first 92 bytes)
++	binary.LittleEndian.PutUint32(b, msg.Type)
++	binary.LittleEndian.PutUint32(b[4:], msg.Sender)
++	binary.LittleEndian.PutUint32(b[8:], msg.Receiver)
++	copy(b[12:], msg.Ephemeral[:])
++	copy(b[44:], msg.Empty[:])
++	copy(b[60:], msg.MAC1[:])
++	copy(b[76:], msg.MAC2[:])
++	
++	// Marshal PQC extension fields (after standard 92 bytes)
++	offset := MessageResponseSize
++	copy(b[offset:], msg.ER[:])
++	offset += len(msg.ER)
++	copy(b[offset:], msg.CTee[:])
++	offset += len(msg.CTee)
++	copy(b[offset:], msg.CTse[:])
++
++	return nil
++}
++
+ type Handshake struct {
+ 	state                     handshakeState
+ 	mutex                     sync.RWMutex
+ 	hash                      [blake2s.Size]byte       // hash value
+ 	chainKey                  [blake2s.Size]byte       // chain key
+-	presharedKey              NoisePresharedKey        // psk
++	presharedKey              NoisePresharedKey        // user's PSK (set via wg set)
++	pqcKey                    NoisePresharedKey        // PQC-derived key (or PQC ⊕ PSK if both set)
+ 	localEphemeral            NoisePrivateKey          // ephemeral secret key
+ 	localIndex                uint32                   // used to clear hash-table
+ 	remoteIndex               uint32                   // index for sending
+@@ -225,6 +369,11 @@ type Handshake struct {
+ 	lastTimestamp             tai64n.Timestamp
+ 	lastInitiationConsumption time.Time
+ 	lastSentHandshake         time.Time
++	// PQC state
++	remotePQCStatic     NoisePQCPublicKey // remote PQC public key
++	pqcEphemeralPrivate NoisePQCSeed      // PQC ephemeral private key (for initiation)
++	pqcKeySchedule      *pqKeySchedule    // PQC key schedule state
++	pqcRemoteEphemeral  NoisePQCPublicKey // remote PQC ephemeral key (stored during initiation consumption)
+ }
+
+ var (
+@@ -497,12 +646,18 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
+ 	var tau [blake2s.Size]byte
+ 	var key [chacha20poly1305.KeySize]byte
+
++	// If either is unset (all zeros), XOR with zeros is a no-op
++	var combinedKey NoisePresharedKey
++	for i := range combinedKey {
++		combinedKey[i] = handshake.presharedKey[i] ^ handshake.pqcKey[i]
++	}
++
+ 	KDF3(
+ 		&handshake.chainKey,
+ 		&tau,
+ 		&key,
+ 		handshake.chainKey[:],
+-		handshake.presharedKey[:],
++		combinedKey[:],
+ 	)
+
+ 	handshake.mixHash(tau[:])
+@@ -569,6 +724,11 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
+ 		setZero(ss[:])
+
+ 		// add preshared key (psk)
++		// If either is unset (all zeros), XOR with zeros is a no-op
++		var combinedKey NoisePresharedKey
++		for i := range combinedKey {
++			combinedKey[i] = handshake.presharedKey[i] ^ handshake.pqcKey[i]
++		}
+
+ 		var tau [blake2s.Size]byte
+ 		var key [chacha20poly1305.KeySize]byte
+@@ -577,7 +737,7 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
+ 			&tau,
+ 			&key,
+ 			chainKey[:],
+-			handshake.presharedKey[:],
++			combinedKey[:],
+ 		)
+ 		mixHash(&hash, &hash, tau[:])
+
+@@ -613,6 +773,465 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
+ 	return lookup.peer
+ }
+
++func (device *Device) CreateMessagePQCInitiation(peer *Peer) (*MessagePQCInitiation, error) {
++	device.staticIdentity.RLock()
++	defer device.staticIdentity.RUnlock()
++
++	handshake := &peer.handshake
++	handshake.mutex.Lock()
++	defer handshake.mutex.Unlock()
++
++	// === PART 1: Standard X25519 handshake initiation ===
++	// This creates the standard WireGuard fields (Ephemeral, Static, Timestamp)
++	
++	// create ephemeral key
++	var err error
++	handshake.hash = InitialHash
++	handshake.chainKey = InitialChainKey
++	handshake.localEphemeral, err = newPrivateKey()
++	if err != nil {
++		return nil, err
++	}
++
++	handshake.mixHash(handshake.remoteStatic[:])
++
++	msg := &MessagePQCInitiation{
++		Type:      MessagePQCInitiationType,
++		Ephemeral: handshake.localEphemeral.publicKey(),
++	}
++
++	handshake.mixKey(msg.Ephemeral[:])
++	handshake.mixHash(msg.Ephemeral[:])
++
++	// encrypt static key
++	ss, err := handshake.localEphemeral.sharedSecret(handshake.remoteStatic)
++	if err != nil {
++		return nil, err
++	}
++	var key [chacha20poly1305.KeySize]byte
++	KDF2(
++		&handshake.chainKey,
++		&key,
++		handshake.chainKey[:],
++		ss[:],
++	)
++	aead, _ := chacha20poly1305.New(key[:])
++	aead.Seal(msg.Static[:0], ZeroNonce[:], device.staticIdentity.publicKey[:], handshake.hash[:])
++	handshake.mixHash(msg.Static[:])
++
++	// encrypt timestamp
++	if isZero(handshake.precomputedStaticStatic[:]) {
++		return nil, errInvalidPublicKey
++	}
++	KDF2(
++		&handshake.chainKey,
++		&key,
++		handshake.chainKey[:],
++		handshake.precomputedStaticStatic[:],
++	)
++	timestamp := tai64n.Now()
++	aead, _ = chacha20poly1305.New(key[:])
++	aead.Seal(msg.Timestamp[:0], ZeroNonce[:], timestamp[:], handshake.hash[:])
++	handshake.mixHash(msg.Timestamp[:])
++
++	// === PART 2: PQC extension fields ===
++	// Append ML-KEM-768 fields for hybrid security
++	
++	localPQCStatic := device.staticIdentity.pqcPublicKey
++	
++	// Build PQC Msg1
++	ctss, ei, encSI, eiPriv, ks, err := BuildPQCMsg1(localPQCStatic, handshake.remotePQCStatic)
++	if err != nil {
++		return nil, fmt.Errorf("BuildPQCMsg1 failed: %w", err)
++	}
++
++	// Store ephemeral private key and key schedule for later
++	handshake.pqcEphemeralPrivate = eiPriv
++	handshake.pqcKeySchedule = ks
++
++	// Add PQC fields to message
++	msg.CTss = ctss
++	msg.EI = ei
++	copy(msg.EncSI[:], encSI)
++
++	// Assign index
++	device.indexTable.Delete(handshake.localIndex)
++	msg.Sender, err = device.indexTable.NewIndexForHandshake(peer, handshake)
++	if err != nil {
++		return nil, err
++	}
++	handshake.localIndex = msg.Sender
++
++	handshake.state = handshakeInitiationCreated
++	return msg, nil
++}
++
++func (device *Device) ConsumeMessagePQCInitiation(msg *MessagePQCInitiation, endpoint conn.Endpoint) *Peer {
++	var (
++		hash     [blake2s.Size]byte
++		chainKey [blake2s.Size]byte
++	)
++
++	if msg.Type != MessagePQCInitiationType {
++		return nil
++	}
++
++	device.staticIdentity.RLock()
++	defer device.staticIdentity.RUnlock()
++
++	// === PART 1: Process standard X25519 handshake initiation ===
++	// This validates the standard WireGuard fields
++	
++	mixHash(&hash, &InitialHash, device.staticIdentity.publicKey[:])
++	mixHash(&hash, &hash, msg.Ephemeral[:])
++	mixKey(&chainKey, &InitialChainKey, msg.Ephemeral[:])
++
++	// decrypt static key
++	var peerPK NoisePublicKey
++	var key [chacha20poly1305.KeySize]byte
++	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
++	if err != nil {
++		return nil
++	}
++	KDF2(&chainKey, &key, chainKey[:], ss[:])
++	aead, _ := chacha20poly1305.New(key[:])
++	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
++	if err != nil {
++		return nil
++	}
++	mixHash(&hash, &hash, msg.Static[:])
++
++	// lookup peer by X25519 key
++	initEP, ok := endpoint.(conn.InitiationAwareEndpoint)
++	if ok {
++		initEP.InitiationMessagePublicKey(peerPK)
++	}
++
++	peer := device.LookupPeer(peerPK)
++	if peer == nil || !peer.isRunning.Load() {
++		return nil
++	}
++
++	handshake := &peer.handshake
++
++	// verify identity and decrypt timestamp
++	var timestamp tai64n.Timestamp
++
++	handshake.mutex.RLock()
++
++	if isZero(handshake.precomputedStaticStatic[:]) {
++		handshake.mutex.RUnlock()
++		return nil
++	}
++	KDF2(
++		&chainKey,
++		&key,
++		chainKey[:],
++		handshake.precomputedStaticStatic[:],
++	)
++	aead, _ = chacha20poly1305.New(key[:])
++	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
++	if err != nil {
++		handshake.mutex.RUnlock()
++		return nil
++	}
++	mixHash(&hash, &hash, msg.Timestamp[:])
++
++	// protect against replay & flood
++	replay := !timestamp.After(handshake.lastTimestamp)
++	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
++	handshake.mutex.RUnlock()
++	if replay {
++		device.log.Verbosef("%v - ConsumeMessagePQCInitiation: handshake replay @ %v", peer, timestamp)
++		return nil
++	}
++	if flood {
++		device.log.Verbosef("%v - ConsumeMessagePQCInitiation: handshake flood", peer)
++		return nil
++	}
++
++	// === PART 2: Process PQC extension fields ===
++	// This validates the ML-KEM-768 fields for hybrid security
++	
++	localPQCStatic := device.staticIdentity.pqcPublicKey
++	localPQCPrivateSeed := device.staticIdentity.pqcSeed
++	
++	device.log.Errorf("ConsumeMessagePQCInitiation: Processing PQC Msg1 with localPQCStatic len=%d", len(localPQCStatic))
++	initiatorStaticPub, ks, err := ProcessPQCMsg1(
++		localPQCStatic,
++		localPQCPrivateSeed,
++		msg.CTss,
++		msg.EI,
++		msg.EncSI[:],
++	)
++	if err != nil {
++		device.log.Errorf("ProcessPQCMsg1 failed: %v", err)
++		return nil
++	}
++
++	device.log.Errorf("ConsumeMessagePQCInitiation: Successfully decrypted initiator static key, len=%d", len(initiatorStaticPub))
++
++	// Verify PQC key matches the peer we found via X25519
++	if !bytes.Equal(initiatorStaticPub[:], handshake.remotePQCStatic[:]) {
++		device.log.Errorf("%v - ConsumeMessagePQCInitiation: PQC key mismatch!", peer)
++		return nil
++	}
++
++	device.log.Errorf("%v - ConsumeMessagePQCInitiation: Both X25519 and PQC validation passed", peer)
++
++	// Update handshake state with both X25519 and PQC data
++	handshake.mutex.Lock()
++	
++	// Standard X25519 state
++	handshake.hash = hash
++	handshake.chainKey = chainKey
++	handshake.remoteIndex = msg.Sender
++	handshake.remoteEphemeral = msg.Ephemeral
++	if timestamp.After(handshake.lastTimestamp) {
++		handshake.lastTimestamp = timestamp
++	}
++	now := time.Now()
++	if now.After(handshake.lastInitiationConsumption) {
++		handshake.lastInitiationConsumption = now
++	}
++	
++	// PQC state
++	handshake.pqcKeySchedule = ks
++	handshake.pqcRemoteEphemeral = msg.EI
++	
++	handshake.state = handshakeInitiationConsumed
++	handshake.mutex.Unlock()
++
++	setZero(hash[:])
++	setZero(chainKey[:])
++
++	return peer
++}
++
++func (device *Device) CreateMessagePQCResponse(peer *Peer) (*MessagePQCResponse, error) {
++	handshake := &peer.handshake
++	handshake.mutex.Lock()
++	defer handshake.mutex.Unlock()
++
++	if handshake.state != handshakeInitiationConsumed {
++		return nil, errors.New("handshake initiation must be consumed first")
++	}
++
++	if handshake.pqcKeySchedule == nil {
++		return nil, errors.New("PQC key schedule not initialized")
++	}
++
++	// === PART 1: Standard X25519 response ===
++	
++	// assign index
++	var err error
++	device.indexTable.Delete(handshake.localIndex)
++	handshake.localIndex, err = device.indexTable.NewIndexForHandshake(peer, handshake)
++	if err != nil {
++		return nil, err
++	}
++
++	msg := &MessagePQCResponse{
++		Type:     MessagePQCResponseType,
++		Sender:   handshake.localIndex,
++		Receiver: handshake.remoteIndex,
++	}
++
++	// create ephemeral key
++	handshake.localEphemeral, err = newPrivateKey()
++	if err != nil {
++		return nil, err
++	}
++	msg.Ephemeral = handshake.localEphemeral.publicKey()
++	handshake.mixHash(msg.Ephemeral[:])
++	handshake.mixKey(msg.Ephemeral[:])
++
++	ss, err := handshake.localEphemeral.sharedSecret(handshake.remoteEphemeral)
++	if err != nil {
++		return nil, err
++	}
++	handshake.mixKey(ss[:])
++	ss, err = handshake.localEphemeral.sharedSecret(handshake.remoteStatic)
++	if err != nil {
++		return nil, err
++	}
++	handshake.mixKey(ss[:])
++
++	// === PART 2: PQC extension fields ===
++	
++	// Build PQC Msg2
++	er, ctee, ctse, psk, err := BuildPQCMsg2(
++		handshake.pqcRemoteEphemeral,
++		handshake.remotePQCStatic,
++		handshake.pqcKeySchedule,
++	)
++	if err != nil {
++		return nil, fmt.Errorf("BuildPQCMsg2 failed: %w", err)
++	}
++
++	// Store PQC-derived key
++	handshake.pqcKey = psk
++	
++	// Add PQC fields to message
++	msg.ER = er
++	msg.CTee = ctee
++	msg.CTse = ctse
++
++	// === PART 3: Combine with preshared key ===
++	// Add combined preshared key (user PSK XOR PQC key)
++	
++	var tau [blake2s.Size]byte
++	var key [chacha20poly1305.KeySize]byte
++
++	// Always XOR both keys to avoid timing attacks
++	var combinedKey NoisePresharedKey
++	for i := range combinedKey {
++		combinedKey[i] = handshake.presharedKey[i] ^ handshake.pqcKey[i]
++	}
++
++	KDF3(
++		&handshake.chainKey,
++		&tau,
++		&key,
++		handshake.chainKey[:],
++		combinedKey[:],
++	)
++
++	handshake.mixHash(tau[:])
++
++	aead, _ := chacha20poly1305.New(key[:])
++	aead.Seal(msg.Empty[:0], ZeroNonce[:], nil, handshake.hash[:])
++	handshake.mixHash(msg.Empty[:])
++
++	handshake.state = handshakeResponseCreated
++	return msg, nil
++}
++
++func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
++	if msg.Type != MessagePQCResponseType {
++		return nil
++	}
++
++	// Lookup handshake by receiver
++	lookup := device.indexTable.Lookup(msg.Receiver)
++	handshake := lookup.handshake
++	if handshake == nil {
++		return nil
++	}
++
++	var (
++		hash     [blake2s.Size]byte
++		chainKey [blake2s.Size]byte
++	)
++
++	ok := func() bool {
++		// lock handshake state
++		handshake.mutex.RLock()
++		defer handshake.mutex.RUnlock()
++
++		if handshake.state != handshakeInitiationCreated {
++			return false
++		}
++
++		if handshake.pqcKeySchedule == nil {
++			return false
++		}
++
++		// lock private key for reading
++		device.staticIdentity.RLock()
++		defer device.staticIdentity.RUnlock()
++
++		// === PART 1: Process standard X25519 response ===
++		
++		// finish 3-way DH
++		mixHash(&hash, &handshake.hash, msg.Ephemeral[:])
++		mixKey(&chainKey, &handshake.chainKey, msg.Ephemeral[:])
++
++		ss, err := handshake.localEphemeral.sharedSecret(msg.Ephemeral)
++		if err != nil {
++			return false
++		}
++		mixKey(&chainKey, &chainKey, ss[:])
++		setZero(ss[:])
++
++		ss, err = device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
++		if err != nil {
++			return false
++		}
++		mixKey(&chainKey, &chainKey, ss[:])
++		setZero(ss[:])
++
++		// === PART 2: Process PQC extension fields ===
++		
++		localPQCPrivateSeed := device.staticIdentity.pqcSeed
++		
++		// Process PQC Msg2
++		psk, err := ProcessPQCMsg2(
++			handshake.pqcEphemeralPrivate,
++			localPQCPrivateSeed,
++			msg.ER,
++			msg.CTee,
++			msg.CTse,
++			handshake.pqcKeySchedule,
++		)
++		if err != nil {
++			return false
++		}
++
++		// Store PQC-derived key temporarily (will be committed if validation passes)
++		// We need to store it now because it's used in the combined key below
++		handshake.pqcKey = psk
++
++		// === PART 3: Validate with combined preshared key ===
++		// Combine preshared key (user PSK XOR PQC key)
++		
++		// Always XOR both keys to avoid timing attacks
++		var combinedKey NoisePresharedKey
++		for i := range combinedKey {
++			combinedKey[i] = handshake.presharedKey[i] ^ handshake.pqcKey[i]
++		}
++
++		var tau [blake2s.Size]byte
++		var key [chacha20poly1305.KeySize]byte
++		KDF3(
++			&chainKey,
++			&tau,
++			&key,
++			chainKey[:],
++			combinedKey[:],
++		)
++		mixHash(&hash, &hash, tau[:])
++
++		// authenticate transcript
++		aead, _ := chacha20poly1305.New(key[:])
++		_, err = aead.Open(nil, ZeroNonce[:], msg.Empty[:], hash[:])
++		if err != nil {
++			return false
++		}
++		mixHash(&hash, &hash, msg.Empty[:])
++		return true
++	}()
++
++	if !ok {
++		return nil
++	}
++
++	// update handshake state
++	handshake.mutex.Lock()
++
++	handshake.hash = hash
++	handshake.chainKey = chainKey
++	handshake.remoteIndex = msg.Sender
++	handshake.state = handshakeResponseConsumed
++
++	handshake.mutex.Unlock()
++
++	setZero(hash[:])
++	setZero(chainKey[:])
++
++	return lookup.peer
++}
++
+ /* Derives a new keypair from the current handshake state
+  *
+  */
+diff --git a/device/noise-types.go b/device/noise-types.go
+index e850359..eec6478 100644
+--- a/device/noise-types.go
++++ b/device/noise-types.go
+@@ -15,6 +15,12 @@ const (
+ 	NoisePublicKeySize    = 32
+ 	NoisePrivateKeySize   = 32
+ 	NoisePresharedKeySize = 32
++
++	// PQC key sizes for ML-KEM-768 (post-quantum key encapsulation)
++	NoisePQCPublicKeySize    = 1184 // ML-KEM-768 public key (encapsulation key)
++	NoisePQCSeedSize         = 64   // ML-KEM-768 seed for deterministic key generation (d || z)
++	NoisePQCCiphertextSize   = 1088 // ML-KEM-768 ciphertext
++	NoisePQCSharedSecretSize = 32   // ML-KEM-768 shared secret
+ )
+
+ type (
+@@ -22,6 +28,12 @@ type (
+ 	NoisePrivateKey   [NoisePrivateKeySize]byte
+ 	NoisePresharedKey [NoisePresharedKeySize]byte
+ 	NoiseNonce        uint64 // padded to 12-bytes
++
++	// PQC key types for ML-KEM-768 post-quantum cryptography
++	NoisePQCPublicKey    [NoisePQCPublicKeySize]byte
++	NoisePQCSeed         [NoisePQCSeedSize]byte // Seed for deterministic key generation
++	NoisePQCCiphertext   [NoisePQCCiphertextSize]byte
++	NoisePQCSharedSecret [NoisePQCSharedSecretSize]byte
+ )
+
+ func loadExactHex(dst []byte, src string) error {
+@@ -76,3 +88,57 @@ func (key NoisePublicKey) Equals(tar NoisePublicKey) bool {
+ func (key *NoisePresharedKey) FromHex(src string) error {
+ 	return loadExactHex(key[:], src)
+ }
++
++// PQC key helper methods
++
++func (key NoisePQCPublicKey) IsZero() bool {
++	var zero NoisePQCPublicKey
++	return key.Equals(zero)
++}
++
++func (key NoisePQCPublicKey) Equals(tar NoisePQCPublicKey) bool {
++	return subtle.ConstantTimeCompare(key[:], tar[:]) == 1
++}
++
++func (key *NoisePQCPublicKey) FromHex(src string) error {
++	return loadExactHex(key[:], src)
++}
++
++func (key *NoisePQCPublicKey) FromBytes(src []byte) error {
++	if len(src) != NoisePQCPublicKeySize {
++		return errors.New("invalid PQC public key size")
++	}
++	copy(key[:], src)
++	return nil
++}
++
++func (key NoisePQCSeed) IsZero() bool {
++	var zero NoisePQCSeed
++	return key.Equals(zero)
++}
++
++func (key NoisePQCSeed) Equals(tar NoisePQCSeed) bool {
++	return subtle.ConstantTimeCompare(key[:], tar[:]) == 1
++}
++
++func (key *NoisePQCSeed) FromHex(src string) error {
++	return loadExactHex(key[:], src)
++}
++
++func (key *NoisePQCSeed) FromBytes(src []byte) error {
++	if len(src) != NoisePQCSeedSize {
++		return errors.New("invalid PQC seed size")
++	}
++	copy(key[:], src)
++	return nil
++}
++
++func (key NoisePQCCiphertext) IsZero() bool {
++	var zero NoisePQCCiphertext
++	return subtle.ConstantTimeCompare(key[:], zero[:]) == 1
++}
++
++func (key NoisePQCSharedSecret) IsZero() bool {
++	var zero NoisePQCSharedSecret
++	return subtle.ConstantTimeCompare(key[:], zero[:]) == 1
++}
+diff --git a/device/pqc_handshake.go b/device/pqc_handshake.go
+new file mode 100644
+index 0000000..acb2ca5
+--- /dev/null
++++ b/device/pqc_handshake.go
+@@ -0,0 +1,278 @@
++// SPDX-License-Identifier: MIT
++//
++// Pure PQC handshake implementation (pqIK pattern from quantshake)
++// This runs independently of the WireGuard Noise protocol
++
++package device
++
++import (
++	"crypto/hmac"
++	"crypto/sha256"
++	"fmt"
++
++	"golang.org/x/crypto/chacha20poly1305"
++)
++
++// pqKeySchedule maintains the hash chain and chaining key for PQC handshake
++type pqKeySchedule struct {
++	h  []byte // transcript hash
++	ck []byte // chaining key
++}
++
++func newPQKeySchedule(prologue string) *pqKeySchedule {
++	ph := sha256.Sum256([]byte(prologue))
++	return &pqKeySchedule{
++		h:  ph[:],
++		ck: ph[:],
++	}
++}
++
++func (ks *pqKeySchedule) mixHash(data []byte) {
++	h := sha256.New()
++	h.Write(ks.h)
++	h.Write(data)
++	ks.h = h.Sum(nil)
++}
++
++func (ks *pqKeySchedule) mixKey(ikm []byte) {
++	prk := hkdfExtractSHA256(ks.ck, ikm)
++	ks.ck = hkdfExpandSHA256(prk, []byte("MixKey"), 32)
++}
++
++func (ks *pqKeySchedule) encryptAndHash(plaintext []byte) ([]byte, error) {
++	prk := hkdfExtractSHA256(ks.ck, nil)
++	key := hkdfExpandSHA256(prk, []byte("encrypt"), 32)
++	defer zeroBytes(key)
++
++	nonce, err := deriveAckNonce(key, ks.h)
++	if err != nil {
++		return nil, err
++	}
++
++	aead, err := chacha20poly1305.New(key)
++	if err != nil {
++		return nil, err
++	}
++
++	ciphertext := aead.Seal(nil, nonce[:], plaintext, ks.h)
++	ks.mixHash(ciphertext)
++	return ciphertext, nil
++}
++
++func (ks *pqKeySchedule) decryptAndHash(ciphertext []byte) ([]byte, error) {
++	prk := hkdfExtractSHA256(ks.ck, nil)
++	key := hkdfExpandSHA256(prk, []byte("encrypt"), 32)
++	defer zeroBytes(key)
++
++	nonce, err := deriveAckNonce(key, ks.h)
++	if err != nil {
++		return nil, err
++	}
++
++	aead, err := chacha20poly1305.New(key)
++	if err != nil {
++		return nil, err
++	}
++
++	plaintext, err := aead.Open(nil, nonce[:], ciphertext, ks.h)
++	if err != nil {
++		return nil, fmt.Errorf("decrypt failed: %w", err)
++	}
++
++	ks.mixHash(ciphertext)
++	return plaintext, nil
++}
++
++func hkdfExtractSHA256(salt, ikm []byte) []byte {
++	m := hmac.New(sha256.New, salt)
++	m.Write(ikm)
++	return m.Sum(nil)
++}
++
++func hkdfExpandSHA256(prk, info []byte, l int) []byte {
++	var res, t []byte
++	for i := byte(1); len(res) < l; i++ {
++		h := hmac.New(sha256.New, prk)
++		h.Write(t)
++		h.Write(info)
++		h.Write([]byte{i})
++		t = h.Sum(nil)
++		res = append(res, t...)
++	}
++	return res[:l]
++}
++
++func deriveAckNonce(key, hash []byte) ([chacha20poly1305.NonceSize]byte, error) {
++	var nonce [chacha20poly1305.NonceSize]byte
++	h := sha256.New()
++	h.Write(key)
++	h.Write(hash)
++	derived := h.Sum(nil)
++	copy(nonce[:], derived[:chacha20poly1305.NonceSize])
++	return nonce, nil
++}
++
++func zeroBytes(b []byte) {
++	for i := range b {
++		b[i] = 0
++	}
++}
++
++// BuildPQCMsg1 builds the PQC portion of the initiation message (quantshake Msg1)
++// Returns: CTss, EI, EncSI
++func BuildPQCMsg1(localStaticPub NoisePQCPublicKey, remoteStaticPub NoisePQCPublicKey) (
++	ctss NoisePQCCiphertext,
++	ei NoisePQCPublicKey,
++	encSI []byte,
++	eiPriv NoisePQCSeed,
++	ks *pqKeySchedule,
++	err error,
++) {
++	// Initialize with pqIK prologue
++	ks = newPQKeySchedule("pqIK_PQKEM_ChaChaPoly_SHA256")
++	ks.mixHash([]byte("wireguard-pqc-v1")) // Additional context
++
++	// Pre-message: <- s (responder's static key is known)
++	ks.mixHash(remoteStaticPub[:])
++
++	// -> skem (encapsulate to responder's static key)
++	ssSS, ctSS, err := PQCEncapsulate(remoteStaticPub)
++	if err != nil {
++		return ctss, ei, nil, eiPriv, nil, fmt.Errorf("ss encapsulation failed: %w", err)
++	}
++	copy(ctss[:], ctSS[:])
++	ks.mixHash(ctss[:])
++	ks.mixKey(ssSS[:])
++
++	// Generate ephemeral key
++	eiPub, eiSk, err := PQCGenerateKeyPair()
++	if err != nil {
++		return ctss, ei, nil, eiPriv, nil, fmt.Errorf("ephemeral key generation failed: %w", err)
++	}
++	copy(ei[:], eiPub[:])
++	copy(eiPriv[:], eiSk[:])
++
++	// -> e
++	ks.mixHash(ei[:])
++
++	// -> s (encrypt initiator static public key)
++	encSI, err = ks.encryptAndHash(localStaticPub[:])
++	if err != nil {
++		return ctss, ei, nil, eiPriv, nil, fmt.Errorf("failed to encrypt static key: %w", err)
++	}
++
++	return ctss, ei, encSI, eiPriv, ks, nil
++}
++
++// ProcessPQCMsg1 processes the PQC portion of the initiation message
++// Returns the derived key schedule state
++func ProcessPQCMsg1(
++	localStaticPub NoisePQCPublicKey,
++	localStaticPriv NoisePQCSeed,
++	ctss NoisePQCCiphertext,
++	ei NoisePQCPublicKey,
++	encSI []byte,
++) (initiatorStaticPub NoisePQCPublicKey, ks *pqKeySchedule, err error) {
++	// Initialize with same prologue
++	ks = newPQKeySchedule("pqIK_PQKEM_ChaChaPoly_SHA256")
++	ks.mixHash([]byte("wireguard-pqc-v1"))
++
++	// Pre-message: <- s
++	ks.mixHash(localStaticPub[:])
++
++	// <- skem (decapsulate with our static key)
++	ssSS, err := PQCDecapsulate(localStaticPriv, ctss)
++	if err != nil {
++		return initiatorStaticPub, nil, fmt.Errorf("ss decapsulation failed: %w", err)
++	}
++	ks.mixHash(ctss[:])
++	ks.mixKey(ssSS[:])
++
++	// <- e
++	ks.mixHash(ei[:])
++
++	// <- s (decrypt initiator static public key)
++	siBytes, err := ks.decryptAndHash(encSI)
++	if err != nil {
++		return initiatorStaticPub, nil, fmt.Errorf("failed to decrypt initiator static key: %w", err)
++	}
++	copy(initiatorStaticPub[:], siBytes)
++
++	return initiatorStaticPub, ks, nil
++}
++
++// BuildPQCMsg2 builds the PQC portion of the response message (quantshake Msg2)
++func BuildPQCMsg2(
++	initiatorEphemeralPub NoisePQCPublicKey,
++	initiatorStaticPub NoisePQCPublicKey,
++	ks *pqKeySchedule,
++) (er NoisePQCPublicKey, ctee NoisePQCCiphertext, ctse NoisePQCCiphertext, psk [32]byte, err error) {
++	// Generate responder ephemeral key
++	erPub, _, err := PQCGenerateKeyPair()
++	if err != nil {
++		return er, ctee, ctse, psk, fmt.Errorf("ephemeral key generation failed: %w", err)
++	}
++	copy(er[:], erPub[:])
++
++	// <- e
++	ks.mixHash(er[:])
++
++	// <- ekem (encapsulate to initiator's ephemeral key)
++	ssEE, ctEE, err := PQCEncapsulate(initiatorEphemeralPub)
++	if err != nil {
++		return er, ctee, ctse, psk, fmt.Errorf("ee encapsulation failed: %w", err)
++	}
++	copy(ctee[:], ctEE[:])
++	ks.mixHash(ctee[:])
++	ks.mixKey(ssEE[:])
++
++	// <- skem (encapsulate to initiator's static key)
++	ssSE, ctSE, err := PQCEncapsulate(initiatorStaticPub)
++	if err != nil {
++		return er, ctee, ctse, psk, fmt.Errorf("se encapsulation failed: %w", err)
++	}
++	copy(ctse[:], ctSE[:])
++	ks.mixHash(ctse[:])
++	ks.mixKey(ssSE[:])
++
++	// Derive PSK from final chaining key
++	pskBytes := hkdfExpandSHA256(ks.ck, []byte("shared"), 32)
++	copy(psk[:], pskBytes)
++
++	return er, ctee, ctse, psk, nil
++}
++
++// ProcessPQCMsg2 processes the PQC portion of the response message
++func ProcessPQCMsg2(
++	localEphemeralPriv NoisePQCSeed,
++	localStaticPriv NoisePQCSeed,
++	er NoisePQCPublicKey,
++	ctee NoisePQCCiphertext,
++	ctse NoisePQCCiphertext,
++	ks *pqKeySchedule,
++) (psk [32]byte, err error) {
++	// <- e
++	ks.mixHash(er[:])
++
++	// <- ekem (decapsulate with our ephemeral key)
++	ks.mixHash(ctee[:])
++	ssEE, err := PQCDecapsulate(localEphemeralPriv, ctee)
++	if err != nil {
++		return psk, fmt.Errorf("ee decapsulation failed: %w", err)
++	}
++	ks.mixKey(ssEE[:])
++
++	// <- skem (decapsulate with our static key)
++	ks.mixHash(ctse[:])
++	ssSE, err := PQCDecapsulate(localStaticPriv, ctse)
++	if err != nil {
++		return psk, fmt.Errorf("se decapsulation failed: %w", err)
++	}
++	ks.mixKey(ssSE[:])
++
++	// Derive PSK from final chaining key
++	pskBytes := hkdfExpandSHA256(ks.ck, []byte("shared"), 32)
++	copy(psk[:], pskBytes)
++
++	return psk, nil
++}
+diff --git a/device/pqc_handshake_test.go b/device/pqc_handshake_test.go
+new file mode 100644
+index 0000000..3d7dcc5
+--- /dev/null
++++ b/device/pqc_handshake_test.go
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier: MIT
++
++package device
++
++import (
++	"bytes"
++	"testing"
++)
++
++func TestPQCHandshakeMsg1Build(t *testing.T) {
++	// Generate keys for initiator and responder
++	initiatorPub, _, err := PQCGenerateKeyPair()
++	if err != nil {
++		t.Fatalf("Failed to generate initiator key: %v", err)
++	}
++
++	responderPub, _, err := PQCGenerateKeyPair()
++	if err != nil {
++		t.Fatalf("Failed to generate responder key: %v", err)
++	}
++
++	// Build Msg1
++	ctss, ei, encSI, eiPriv, ks, err := BuildPQCMsg1(initiatorPub, responderPub)
++	if err != nil {
++		t.Fatalf("BuildPQCMsg1 failed: %v", err)
++	}
++
++	// Verify outputs
++	if len(ctss) != NoisePQCCiphertextSize {
++		t.Errorf("Expected ctss size %d, got %d", NoisePQCCiphertextSize, len(ctss))
++	}
++
++	if len(ei) != NoisePQCPublicKeySize {
++		t.Errorf("Expected ei size %d, got %d", NoisePQCPublicKeySize, len(ei))
++	}
++
++	// encSI should be static key + poly1305 tag
++	expectedEncSILen := NoisePQCPublicKeySize + 16
++	if len(encSI) != expectedEncSILen {
++		t.Errorf("Expected encSI size %d, got %d", expectedEncSILen, len(encSI))
++	}
++
++	if len(eiPriv) != NoisePQCSeedSize {
++		t.Errorf("Expected eiPriv size %d, got %d", NoisePQCSeedSize, len(eiPriv))
++	}
++
++	if ks == nil {
++		t.Errorf("Key schedule should not be nil")
++	}
++}
++
++func TestPQCHandshakeMsg1ProcessAndMsg2Build(t *testing.T) {
++	// Generate seeds and derive keys
++	var initiatorSeed NoisePQCSeed
++	for i := range initiatorSeed {
++		initiatorSeed[i] = byte(i)
++	}
++	initiatorPub, _, err := PQCGenerateKeyPairFromSeed(initiatorSeed)
++	if err != nil {
++		t.Fatalf("Failed to generate initiator key: %v", err)
++	}
++
++	var responderSeed NoisePQCSeed
++	for i := range responderSeed {
++		responderSeed[i] = byte(i + 100)
++	}
++	responderPub, _, err := PQCGenerateKeyPairFromSeed(responderSeed)
++	if err != nil {
++		t.Fatalf("Failed to generate responder key: %v", err)
++	}
++
++	// Initiator builds Msg1
++	ctss, ei, encSI, _, _, err := BuildPQCMsg1(initiatorPub, responderPub)
++	if err != nil {
++		t.Fatalf("BuildPQCMsg1 failed: %v", err)
++	}
++
++	// Responder processes Msg1
++	recoveredInitiatorPub, ks2, err := ProcessPQCMsg1(responderPub, responderSeed, ctss, ei, encSI)
++	if err != nil {
++		t.Fatalf("ProcessPQCMsg1 failed: %v", err)
++	}
++
++	// Verify the recovered initiator public key matches
++	if recoveredInitiatorPub != initiatorPub {
++		t.Errorf("Recovered initiator public key doesn't match original")
++	}
++
++	// Responder builds Msg2
++	er, ctee, ctse, psk2, err := BuildPQCMsg2(ei, initiatorPub, ks2)
++	if err != nil {
++		t.Fatalf("BuildPQCMsg2 failed: %v", err)
++	}
++
++	// Verify outputs
++	if len(er) != NoisePQCPublicKeySize {
++		t.Errorf("Expected er size %d, got %d", NoisePQCPublicKeySize, len(er))
++	}
++
++	if len(ctee) != NoisePQCCiphertextSize {
++		t.Errorf("Expected ctee size %d, got %d", NoisePQCCiphertextSize, len(ctee))
++	}
++
++	if len(ctse) != NoisePQCCiphertextSize {
++		t.Errorf("Expected ctse size %d, got %d", NoisePQCCiphertextSize, len(ctse))
++	}
++
++	// Check PSK is not zero
++	var zeroPSK [32]byte
++	if psk2 == zeroPSK {
++		t.Errorf("PSK should not be zero")
++	}
++
++	// Note: We can't easily test ProcessPQCMsg2 here because we don't have access to
++	// the ephemeral private key from BuildPQCMsg1. This is tested in the complete handshake test.
++	_ = psk2
++}
++
++func TestPQCHandshakeCompleteness(t *testing.T) {
++	// Generate seeds and derive keys
++	var initiatorSeed NoisePQCSeed
++	for i := range initiatorSeed {
++		initiatorSeed[i] = byte(i)
++	}
++	initiatorPub, _, err := PQCGenerateKeyPairFromSeed(initiatorSeed)
++	if err != nil {
++		t.Fatalf("Failed to generate initiator key: %v", err)
++	}
++
++	var responderSeed NoisePQCSeed
++	for i := range responderSeed {
++		responderSeed[i] = byte(i + 100)
++	}
++	responderPub, _, err := PQCGenerateKeyPairFromSeed(responderSeed)
++	if err != nil {
++		t.Fatalf("Failed to generate responder key: %v", err)
++	}
++
++	// Initiator: Build Msg1
++	ctss, ei, encSI, eiPriv, ks1, err := BuildPQCMsg1(initiatorPub, responderPub)
++	if err != nil {
++		t.Fatalf("Initiator BuildPQCMsg1 failed: %v", err)
++	}
++
++	// Responder: Process Msg1
++	recoveredInitiatorPub, ks2, err := ProcessPQCMsg1(responderPub, responderSeed, ctss, ei, encSI)
++	if err != nil {
++		t.Fatalf("Responder ProcessPQCMsg1 failed: %v", err)
++	}
++
++	if recoveredInitiatorPub != initiatorPub {
++		t.Errorf("Recovered initiator public key doesn't match")
++	}
++
++	// Responder: Build Msg2
++	er, ctee, ctse, psk2, err := BuildPQCMsg2(ei, recoveredInitiatorPub, ks2)
++	if err != nil {
++		t.Fatalf("Responder BuildPQCMsg2 failed: %v", err)
++	}
++
++	// Initiator: Process Msg2
++	psk1, err := ProcessPQCMsg2(eiPriv, initiatorSeed, er, ctee, ctse, ks1)
++	if err != nil {
++		t.Fatalf("Initiator ProcessPQCMsg2 failed: %v", err)
++	}
++
++	// Both parties should have the same PSK
++	if !bytes.Equal(psk1[:], psk2[:]) {
++		t.Errorf("PSKs don't match!\nInitiator PSK: %x\nResponder PSK: %x", psk1, psk2)
++	}
++
++	// PSK should not be zero
++	var zeroPSK [32]byte
++	if psk1 == zeroPSK {
++		t.Errorf("PSK should not be zero")
++	}
++
++	t.Logf("✓ PQC handshake completed successfully, both parties derived same PSK: %x...", psk1[:8])
++}
+diff --git a/device/pqc_keygen.go b/device/pqc_keygen.go
+new file mode 100644
+index 0000000..fcc7a0c
+--- /dev/null
++++ b/device/pqc_keygen.go
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: MIT
++
++package device
++
++import (
++	"crypto/rand"
++	"encoding/hex"
++	"fmt"
++	"io"
++)
++
++// GeneratePQCKeypair generates a new ML-KEM-768 keypair from a random seed.
++// Returns the seed (64 bytes) and public key (1184 bytes) as hex strings.
++func GeneratePQCKeypair() (seedHex, publicKeyHex string, err error) {
++	// Generate random seed (64 bytes for ML-KEM-768)
++	var seed NoisePQCSeed
++	if _, err := io.ReadFull(rand.Reader, seed[:]); err != nil {
++		return "", "", fmt.Errorf("failed to generate random seed: %w", err)
++	}
++
++	// Derive public key from seed
++	publicKey, err := PQCPublicKeyFromSeed(seed)
++	if err != nil {
++		return "", "", fmt.Errorf("failed to derive public key: %w", err)
++	}
++
++	seedHex = hex.EncodeToString(seed[:])
++	publicKeyHex = hex.EncodeToString(publicKey[:])
++
++	return seedHex, publicKeyHex, nil
++}
++
++// PQCPublicKeyFromSeed derives a PQC public key from a seed.
++// This uses the same derivation as the device would use.
++func PQCPublicKeyFromSeed(seed NoisePQCSeed) (NoisePQCPublicKey, error) {
++	// Use the existing PQCGenerateKeyPairFromSeed function
++	publicKey, _, err := PQCGenerateKeyPairFromSeed(seed)
++	if err != nil {
++		return NoisePQCPublicKey{}, err
++	}
++	return publicKey, nil
++}
++
++// ParsePQCSeedHex parses a hex-encoded PQC seed string.
++func ParsePQCSeedHex(hexStr string) (NoisePQCSeed, error) {
++	var seed NoisePQCSeed
++	if err := seed.FromHex(hexStr); err != nil {
++		return NoisePQCSeed{}, fmt.Errorf("failed to parse seed: %w", err)
++	}
++	return seed, nil
++}
++
++// ParsePQCPublicKeyHex parses a hex-encoded PQC public key string.
++func ParsePQCPublicKeyHex(hexStr string) (NoisePQCPublicKey, error) {
++	var pubKey NoisePQCPublicKey
++	if err := pubKey.FromHex(hexStr); err != nil {
++		return NoisePQCPublicKey{}, fmt.Errorf("failed to parse public key: %w", err)
++	}
++	return pubKey, nil
++}
+diff --git a/device/pqc_keygen_test.go b/device/pqc_keygen_test.go
+new file mode 100644
+index 0000000..96dae9c
+--- /dev/null
++++ b/device/pqc_keygen_test.go
+@@ -0,0 +1,155 @@
++// SPDX-License-Identifier: MIT
++
++package device
++
++import (
++	"encoding/hex"
++	"testing"
++)
++
++func TestGeneratePQCKeypair(t *testing.T) {
++	seedHex, publicKeyHex, err := GeneratePQCKeypair()
++	if err != nil {
++		t.Fatalf("GeneratePQCKeypair failed: %v", err)
++	}
++
++	// Check seed length (64 bytes = 128 hex chars)
++	if len(seedHex) != 128 {
++		t.Errorf("Expected seed hex length 128, got %d", len(seedHex))
++	}
++
++	// Check public key length (1184 bytes = 2368 hex chars)
++	if len(publicKeyHex) != 2368 {
++		t.Errorf("Expected public key hex length 2368, got %d", len(publicKeyHex))
++	}
++
++	// Verify seed is valid hex
++	_, err = hex.DecodeString(seedHex)
++	if err != nil {
++		t.Errorf("Seed is not valid hex: %v", err)
++	}
++
++	// Verify public key is valid hex
++	_, err = hex.DecodeString(publicKeyHex)
++	if err != nil {
++		t.Errorf("Public key is not valid hex: %v", err)
++	}
++}
++
++func TestPQCGenerateKeyPairFromSeed(t *testing.T) {
++	// Generate a seed
++	var seed NoisePQCSeed
++	for i := range seed {
++		seed[i] = byte(i)
++	}
++
++	// Generate key pair from seed
++	publicKey, privateKey, err := PQCGenerateKeyPairFromSeed(seed)
++	if err != nil {
++		t.Fatalf("PQCGenerateKeyPairFromSeed failed: %v", err)
++	}
++
++	// Check public key length
++	if len(publicKey) != NoisePQCPublicKeySize {
++		t.Errorf("Expected public key size %d, got %d", NoisePQCPublicKeySize, len(publicKey))
++	}
++
++	// Private key is a DecapsulationKey, just check it's not nil
++	if privateKey == nil {
++		t.Errorf("Private key should not be nil")
++	}
++
++	// Generate again from same seed - should produce same keys
++	publicKey2, privateKey2, err := PQCGenerateKeyPairFromSeed(seed)
++	if err != nil {
++		t.Fatalf("PQCGenerateKeyPairFromSeed second call failed: %v", err)
++	}
++
++	if publicKey != publicKey2 {
++		t.Errorf("Same seed produced different public keys")
++	}
++	if privateKey2 == nil {
++		t.Errorf("Second private key should not be nil")
++	}
++}
++
++func TestPQCEncapsulateDecapsulate(t *testing.T) {
++	// Generate a keypair
++	publicKey, privateKey, err := PQCGenerateKeyPair()
++	if err != nil {
++		t.Fatalf("PQCGenerateKeyPair failed: %v", err)
++	}
++
++	// Convert private key to seed format
++	var privateSeed NoisePQCSeed
++	copy(privateSeed[:], privateKey[:NoisePQCSeedSize])
++
++	// Encapsulate
++	sharedSecret1, ciphertext, err := PQCEncapsulate(publicKey)
++	if err != nil {
++		t.Fatalf("PQCEncapsulate failed: %v", err)
++	}
++
++	// Check ciphertext size
++	if len(ciphertext) != NoisePQCCiphertextSize {
++		t.Errorf("Expected ciphertext size %d, got %d", NoisePQCCiphertextSize, len(ciphertext))
++	}
++
++	// Check shared secret size
++	if len(sharedSecret1) != NoisePQCSharedSecretSize {
++		t.Errorf("Expected shared secret size %d, got %d", NoisePQCSharedSecretSize, len(sharedSecret1))
++	}
++
++	// Decapsulate
++	sharedSecret2, err := PQCDecapsulate(privateSeed, ciphertext)
++	if err != nil {
++		t.Fatalf("PQCDecapsulate failed: %v", err)
++	}
++
++	// Verify shared secrets match
++	if sharedSecret1 != sharedSecret2 {
++		t.Errorf("Shared secrets don't match after encapsulate/decapsulate")
++	}
++}
++
++func TestNoisePQCPublicKeyHexConversion(t *testing.T) {
++	// Generate a public key
++	publicKey, _, err := PQCGenerateKeyPair()
++	if err != nil {
++		t.Fatalf("PQCGenerateKeyPair failed: %v", err)
++	}
++
++	// Convert to hex using hex.EncodeToString
++	hexStr := hex.EncodeToString(publicKey[:])
++	if len(hexStr) != 2368 {
++		t.Errorf("Expected hex length 2368, got %d", len(hexStr))
++	}
++
++	// Convert back from hex
++	var publicKey2 NoisePQCPublicKey
++	err = publicKey2.FromHex(hexStr)
++	if err != nil {
++		t.Fatalf("FromHex failed: %v", err)
++	}
++
++	// Verify they match
++	if publicKey != publicKey2 {
++		t.Errorf("Public key doesn't match after hex conversion")
++	}
++}
++
++func TestNoisePQCPublicKeyIsZero(t *testing.T) {
++	var zeroKey NoisePQCPublicKey
++	if !zeroKey.IsZero() {
++		t.Errorf("Zero key should return true for IsZero()")
++	}
++
++	publicKey, _, err := PQCGenerateKeyPair()
++	if err != nil {
++		t.Fatalf("PQCGenerateKeyPair failed: %v", err)
++	}
++
++	if publicKey.IsZero() {
++		t.Errorf("Generated key should not return true for IsZero()")
++	}
++}
+diff --git a/device/pqc_messages_test.go b/device/pqc_messages_test.go
+new file mode 100644
+index 0000000..534bcd5
+--- /dev/null
++++ b/device/pqc_messages_test.go
+@@ -0,0 +1,207 @@
++// SPDX-License-Identifier: MIT
++
++package device
++
++import (
++	"testing"
++
++	"golang.org/x/crypto/poly1305"
++)
++
++func TestMessagePQCInitiationMarshalUnmarshal(t *testing.T) {
++	// Create a message with test data
++	msg := &MessagePQCInitiation{
++		Type:   MessagePQCInitiationType,
++		Sender: 12345,
++	}
++
++	// Fill with test data
++	for i := range msg.CTss {
++		msg.CTss[i] = byte(i % 256)
++	}
++	for i := range msg.EI {
++		msg.EI[i] = byte((i + 100) % 256)
++	}
++	for i := range msg.EncSI {
++		msg.EncSI[i] = byte((i + 200) % 256)
++	}
++	for i := range msg.MAC1 {
++		msg.MAC1[i] = byte(i)
++	}
++	for i := range msg.MAC2 {
++		msg.MAC2[i] = byte(i + 1)
++	}
++
++	// Marshal
++	buf := make([]byte, MessagePQCInitiationSize)
++	err := msg.marshal(buf)
++	if err != nil {
++		t.Fatalf("marshal failed: %v", err)
++	}
++
++	// Unmarshal
++	var msg2 MessagePQCInitiation
++	err = msg2.unmarshal(buf)
++	if err != nil {
++		t.Fatalf("unmarshal failed: %v", err)
++	}
++
++	// Verify
++	if msg2.Type != msg.Type {
++		t.Errorf("Type mismatch: got %d, want %d", msg2.Type, msg.Type)
++	}
++	if msg2.Sender != msg.Sender {
++		t.Errorf("Sender mismatch: got %d, want %d", msg2.Sender, msg.Sender)
++	}
++	if msg2.CTss != msg.CTss {
++		t.Errorf("CTss mismatch")
++	}
++	if msg2.EI != msg.EI {
++		t.Errorf("EI mismatch")
++	}
++	if msg2.EncSI != msg.EncSI {
++		t.Errorf("EncSI mismatch")
++	}
++	if msg2.MAC1 != msg.MAC1 {
++		t.Errorf("MAC1 mismatch")
++	}
++	if msg2.MAC2 != msg.MAC2 {
++		t.Errorf("MAC2 mismatch")
++	}
++}
++
++func TestMessagePQCResponseMarshalUnmarshal(t *testing.T) {
++	// Create a message with test data
++	msg := &MessagePQCResponse{
++		Type:     MessagePQCResponseType,
++		Sender:   12345,
++		Receiver: 67890,
++	}
++
++	// Fill with test data
++	for i := range msg.ER {
++		msg.ER[i] = byte(i % 256)
++	}
++	for i := range msg.CTee {
++		msg.CTee[i] = byte((i + 50) % 256)
++	}
++	for i := range msg.CTse {
++		msg.CTse[i] = byte((i + 100) % 256)
++	}
++	for i := range msg.MAC1 {
++		msg.MAC1[i] = byte(i)
++	}
++	for i := range msg.MAC2 {
++		msg.MAC2[i] = byte(i + 1)
++	}
++
++	// Marshal
++	buf := make([]byte, MessagePQCResponseSize)
++	err := msg.marshal(buf)
++	if err != nil {
++		t.Fatalf("marshal failed: %v", err)
++	}
++
++	// Unmarshal
++	var msg2 MessagePQCResponse
++	err = msg2.unmarshal(buf)
++	if err != nil {
++		t.Fatalf("unmarshal failed: %v", err)
++	}
++
++	// Verify
++	if msg2.Type != msg.Type {
++		t.Errorf("Type mismatch: got %d, want %d", msg2.Type, msg.Type)
++	}
++	if msg2.Sender != msg.Sender {
++		t.Errorf("Sender mismatch: got %d, want %d", msg2.Sender, msg.Sender)
++	}
++	if msg2.Receiver != msg.Receiver {
++		t.Errorf("Receiver mismatch: got %d, want %d", msg2.Receiver, msg.Receiver)
++	}
++	if msg2.ER != msg.ER {
++		t.Errorf("ER mismatch")
++	}
++	if msg2.CTee != msg.CTee {
++		t.Errorf("CTee mismatch")
++	}
++	if msg2.CTse != msg.CTse {
++		t.Errorf("CTse mismatch")
++	}
++	if msg2.MAC1 != msg.MAC1 {
++		t.Errorf("MAC1 mismatch")
++	}
++	if msg2.MAC2 != msg.MAC2 {
++		t.Errorf("MAC2 mismatch")
++	}
++}
++
++func TestMessagePQCInitiationSizeCalculation(t *testing.T) {
++	// Verify the size constant matches the actual struct
++	// Hybrid message = Standard Initiation (148 bytes) + PQC extension
++	expectedSize := MessageInitiationSize + // Standard WireGuard initiation (148 bytes)
++		NoisePQCCiphertextSize + // CTss (1088 bytes)
++		NoisePQCPublicKeySize + // EI (1184 bytes)
++		(NoisePQCPublicKeySize + poly1305.TagSize) // EncSI (1200 bytes)
++	// Total: 148 + 1088 + 1184 + 1200 = 3620 bytes
++
++	if MessagePQCInitiationSize != expectedSize {
++		t.Errorf("MessagePQCInitiationSize constant (%d) doesn't match calculated size (%d)",
++			MessagePQCInitiationSize, expectedSize)
++	}
++
++	t.Logf("MessagePQCInitiation size: %d bytes (Standard: %d + PQC: %d)",
++		MessagePQCInitiationSize, MessageInitiationSize, MessagePQCInitiationSize-MessageInitiationSize)
++}
++
++func TestMessagePQCResponseSizeCalculation(t *testing.T) {
++	// Verify the size constant matches the actual struct
++	// Hybrid message = Standard Response (92 bytes) + PQC extension
++	expectedSize := MessageResponseSize + // Standard WireGuard response (92 bytes)
++		NoisePQCPublicKeySize + // ER (1184 bytes)
++		NoisePQCCiphertextSize + // CTee (1088 bytes)
++		NoisePQCCiphertextSize // CTse (1088 bytes)
++	// Total: 92 + 1088 + 1088 = 2268 bytes
++
++	if MessagePQCResponseSize != expectedSize {
++		t.Errorf("MessagePQCResponseSize constant (%d) doesn't match calculated size (%d)",
++			MessagePQCResponseSize, expectedSize)
++	}
++
++	t.Logf("MessagePQCResponse size: %d bytes (Standard: %d + PQC: %d)",
++		MessagePQCResponseSize, MessageResponseSize, MessagePQCResponseSize-MessageResponseSize)
++}
++
++func TestMessagePQCInitiationWrongSize(t *testing.T) {
++	msg := &MessagePQCInitiation{Type: MessagePQCInitiationType}
++
++	// Try to marshal with wrong size buffer
++	buf := make([]byte, 100)
++	err := msg.marshal(buf)
++	if err == nil {
++		t.Errorf("Expected error when marshaling with wrong size buffer")
++	}
++
++	// Try to unmarshal with wrong size buffer
++	err = msg.unmarshal(buf)
++	if err == nil {
++		t.Errorf("Expected error when unmarshaling with wrong size buffer")
++	}
++}
++
++func TestMessagePQCResponseWrongSize(t *testing.T) {
++	msg := &MessagePQCResponse{Type: MessagePQCResponseType}
++
++	// Try to marshal with wrong size buffer
++	buf := make([]byte, 100)
++	err := msg.marshal(buf)
++	if err == nil {
++		t.Errorf("Expected error when marshaling with wrong size buffer")
++	}
++
++	// Try to unmarshal with wrong size buffer
++	err = msg.unmarshal(buf)
++	if err == nil {
++		t.Errorf("Expected error when unmarshaling with wrong size buffer")
++	}
++}
+diff --git a/device/receive.go b/device/receive.go
+index 02c8f21..4fb357c 100644
+--- a/device/receive.go
++++ b/device/receive.go
+@@ -202,8 +202,22 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
+ 					continue
+ 				}
+
++			case MessagePQCInitiationType:
++				if len(packet) != MessagePQCInitiationSize {
++					device.log.Errorf("Received PQC initiation with wrong size: got %d, expected %d", len(packet), MessagePQCInitiationSize)
++					continue
++				}
++				device.log.Errorf("Received PQC initiation message (size: %d)", len(packet))
++
++			case MessagePQCResponseType:
++				if len(packet) != MessagePQCResponseSize {
++					device.log.Errorf("Received PQC response with wrong size: got %d, expected %d", len(packet), MessagePQCResponseSize)
++					continue
++				}
++				device.log.Errorf("Received PQC response message (size: %d)", len(packet))
++
+ 			default:
+-				device.log.Verbosef("Received message with unknown type")
++				device.log.Errorf("Received message with unknown type: %d", msgType)
+ 				continue
+ 			}
+
+@@ -311,7 +325,7 @@ func (device *Device) RoutineHandshake(id int) {
+
+ 			goto skip
+
+-		case MessageInitiationType, MessageResponseType:
++		case MessageInitiationType, MessageResponseType, MessagePQCInitiationType, MessagePQCResponseType:
+
+ 			// check mac fields and maybe ratelimit
+
+@@ -417,6 +431,75 @@ func (device *Device) RoutineHandshake(id int) {
+ 				goto skip
+ 			}
+
++			peer.timersSessionDerived()
++			peer.timersHandshakeComplete()
++			peer.SendKeepalive()
++
++		case MessagePQCInitiationType:
++			device.log.Errorf("Processing PQC initiation message")
++
++			// unmarshal
++			var msg MessagePQCInitiation
++			err := msg.unmarshal(elem.packet)
++			if err != nil {
++				device.log.Errorf("Failed to decode PQC initiation message: %v", err)
++				goto skip
++			}
++
++			// consume initiation
++			peer := device.ConsumeMessagePQCInitiation(&msg, elem.endpoint)
++			if peer == nil {
++				// Silently drop - could be a race condition during peer setup or invalid message
++				goto skip
++			}
++
++			// update timers
++			peer.timersAnyAuthenticatedPacketTraversal()
++			peer.timersAnyAuthenticatedPacketReceived()
++
++			// update endpoint
++			peer.SetEndpointFromPacket(elem.endpoint)
++
++			device.log.Errorf("%v - Received PQC handshake initiation", peer)
++			peer.rxBytes.Add(uint64(len(elem.packet)))
++
++			peer.SendHandshakePQCResponse()
++
++		case MessagePQCResponseType:
++			device.log.Errorf("Processing PQC response message")
++
++			// unmarshal
++			var msg MessagePQCResponse
++			err := msg.unmarshal(elem.packet)
++			if err != nil {
++				device.log.Errorf("Failed to decode PQC response message: %v", err)
++				goto skip
++			}
++
++			// consume response
++			peer := device.ConsumeMessagePQCResponse(&msg)
++			if peer == nil {
++				device.log.Errorf("Received invalid PQC response message from %s", elem.endpoint.DstToString())
++				goto skip
++			}
++
++			// update endpoint
++			peer.SetEndpointFromPacket(elem.endpoint)
++
++			device.log.Errorf("%v - Received PQC handshake response", peer)
++			peer.rxBytes.Add(uint64(len(elem.packet)))
++
++			// update timers
++			peer.timersAnyAuthenticatedPacketTraversal()
++			peer.timersAnyAuthenticatedPacketReceived()
++
++			// derive keypair
++			err = peer.BeginSymmetricSession()
++			if err != nil {
++				device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
++				goto skip
++			}
++
+ 			peer.timersSessionDerived()
+ 			peer.timersHandshakeComplete()
+ 			peer.SendKeepalive()
+diff --git a/device/send.go b/device/send.go
+index c8bb079..3add3c1 100644
+--- a/device/send.go
++++ b/device/send.go
+@@ -121,27 +121,53 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+
+ 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
+
+-	msg, err := peer.device.CreateMessageInitiation(peer)
+-	if err != nil {
+-		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+-		return err
+-	}
++	// Check if PQC is configured for this peer
++	peer.handshake.mutex.RLock()
++	usePQC := !peer.handshake.remotePQCStatic.IsZero()
++	deviceHasPQC := !peer.device.staticIdentity.pqcPublicKey.IsZero()
++	peer.device.log.Errorf("%v - Handshake check: remotePQCStatic.IsZero()=%v, deviceHasPQC=%v, usePQC=%v",
++		peer, peer.handshake.remotePQCStatic.IsZero(), deviceHasPQC, usePQC)
++	peer.handshake.mutex.RUnlock()
+
+-	buf := make([]byte, MessageEncapsulatingTransportSize+MessageInitiationSize)
+-	packet := buf[MessageEncapsulatingTransportSize:]
+-	_ = msg.marshal(packet)
+-	peer.cookieGenerator.AddMacs(packet)
++	var buf []byte
++	var packet []byte
++
++	if usePQC {
++		peer.device.log.Errorf("%v - Using PQC handshake initiation", peer)
++		msgPQC, err := peer.device.CreateMessagePQCInitiation(peer)
++		if err != nil {
++			peer.device.log.Errorf("%v - Failed to create PQC initiation message: %v", peer, err)
++			return err
++		}
++
++		buf = make([]byte, MessageEncapsulatingTransportSize+MessagePQCInitiationSize)
++		packet = buf[MessageEncapsulatingTransportSize:]
++		_ = msgPQC.marshal(packet)
++		peer.cookieGenerator.AddMacs(packet)
++	} else {
++		peer.device.log.Errorf("%v - Using classic handshake initiation", peer)
++		msg, err := peer.device.CreateMessageInitiation(peer)
++		if err != nil {
++			peer.device.log.Errorf("%v - Failed to create classic initiation message: %v", peer, err)
++			return err
++		}
++
++		buf = make([]byte, MessageEncapsulatingTransportSize+MessageInitiationSize)
++		packet = buf[MessageEncapsulatingTransportSize:]
++		_ = msg.marshal(packet)
++		peer.cookieGenerator.AddMacs(packet)
++	}
+
+ 	peer.timersAnyAuthenticatedPacketTraversal()
+ 	peer.timersAnyAuthenticatedPacketSent()
+
+-	err = peer.SendBuffers([][]byte{buf})
+-	if err != nil {
+-		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
++	sendErr := peer.SendBuffers([][]byte{buf})
++	if sendErr != nil {
++		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, sendErr)
+ 	}
+ 	peer.timersHandshakeInitiated()
+
+-	return err
++	return sendErr
+ }
+
+ func (peer *Peer) SendHandshakeResponse() error {
+@@ -180,6 +206,41 @@ func (peer *Peer) SendHandshakeResponse() error {
+ 	return err
+ }
+
++func (peer *Peer) SendHandshakePQCResponse() error {
++	peer.handshake.mutex.Lock()
++	peer.handshake.lastSentHandshake = time.Now()
++	peer.handshake.mutex.Unlock()
++
++	peer.device.log.Errorf("%v - Sending PQC handshake response", peer)
++
++	response, err := peer.device.CreateMessagePQCResponse(peer)
++	if err != nil {
++		peer.device.log.Errorf("%v - Failed to create PQC response message: %v", peer, err)
++		return err
++	}
++
++	buf := make([]byte, MessageEncapsulatingTransportSize+MessagePQCResponseSize)
++	packet := buf[MessageEncapsulatingTransportSize:]
++	_ = response.marshal(packet)
++	peer.cookieGenerator.AddMacs(packet)
++
++	err = peer.BeginSymmetricSession()
++	if err != nil {
++		peer.device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
++		return err
++	}
++
++	peer.timersSessionDerived()
++	peer.timersAnyAuthenticatedPacketTraversal()
++	peer.timersAnyAuthenticatedPacketSent()
++
++	err = peer.SendBuffers([][]byte{buf})
++	if err != nil {
++		peer.device.log.Errorf("%v - Failed to send PQC handshake response: %v", peer, err)
++	}
++	return err
++}
++
+ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
+ 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
+
+diff --git a/device/uapi.go b/device/uapi.go
+index 4987cda..3827097 100644
+--- a/device/uapi.go
++++ b/device/uapi.go
+@@ -70,6 +70,18 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
+ 		}
+ 		buf.WriteByte('\n')
+ 	}
++	// pqcKeyf outputs PQC keys (variable length) as hex
++	pqcKeyf := func(prefix string, key []byte) {
++		buf.Grow(len(key)*2 + 2 + len(prefix))
++		buf.WriteString(prefix)
++		buf.WriteByte('=')
++		const hex = "0123456789abcdef"
++		for i := 0; i < len(key); i++ {
++			buf.WriteByte(hex[key[i]>>4])
++			buf.WriteByte(hex[key[i]&0xf])
++		}
++		buf.WriteByte('\n')
++	}
+
+ 	func() {
+ 		// lock required resources
+@@ -89,6 +101,11 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
+ 			keyf("private_key", (*[32]byte)(&device.staticIdentity.privateKey))
+ 		}
+
++		// Output device's PQC public key if set
++		if !device.staticIdentity.pqcPublicKey.IsZero() {
++			pqcKeyf("pqc_public_key", device.staticIdentity.pqcPublicKey[:])
++		}
++
+ 		if device.net.port != 0 {
+ 			sendf("listen_port=%d", device.net.port)
+ 		}
+@@ -101,7 +118,18 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
+ 			// Serialize peer state.
+ 			peer.handshake.mutex.RLock()
+ 			keyf("public_key", (*[32]byte)(&peer.handshake.remoteStatic))
+-			keyf("preshared_key", (*[32]byte)(&peer.handshake.presharedKey))
++
++			// Return the effective PSK being used by WireGuard (presharedKey ⊕ pqcKey)
++			var effectivePSK NoisePresharedKey
++			for i := range effectivePSK {
++				effectivePSK[i] = peer.handshake.presharedKey[i] ^ peer.handshake.pqcKey[i]
++			}
++			keyf("preshared_key", (*[32]byte)(&effectivePSK))
++
++			// Output peer's PQC public key if set
++			if !peer.handshake.remotePQCStatic.IsZero() {
++				pqcKeyf("pqc_public_key", peer.handshake.remotePQCStatic[:])
++			}
+ 			peer.handshake.mutex.RUnlock()
+ 			sendf("protocol_version=1")
+ 			peer.endpoint.Lock()
+@@ -240,6 +268,16 @@ func (device *Device) handleDeviceLine(key, value string) error {
+ 		device.log.Verbosef("UAPI: Removing all peers")
+ 		device.RemoveAllPeers()
+
++	case "pqc_private_key":
++		// Set the device's PQC (ML-KEM-768) seed for post-quantum handshakes
++		var seed NoisePQCSeed
++		err := seed.FromHex(value)
++		if err != nil {
++			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_private_key: %w", err)
++		}
++		device.log.Errorf("UAPI: Setting PQC seed (hex len=%d, seed len=%d)", len(value), len(seed))
++		device.SetPQCSeed(seed)
++
+ 	default:
+ 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI device key: %v", key)
+ 	}
+@@ -386,6 +424,25 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "invalid protocol version: %v", value)
+ 		}
+
++	case "pqc_public_key":
++		// Set the peer's PQC (ML-KEM-768) public key for post-quantum handshakes
++		device.log.Errorf("%v - UAPI: Setting PQC public key (hex len=%d)", peer.Peer, len(value))
++
++		peer.handshake.mutex.Lock()
++		err := peer.handshake.remotePQCStatic.FromHex(value)
++		peer.handshake.mutex.Unlock()
++
++		if err != nil {
++			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_public_key: %w", err)
++		}
++		device.log.Errorf("%v - UAPI: Successfully set PQC public key", peer.Peer)
++
++		// Trigger a new handshake initiation now that PQC is configured
++		if peer.isRunning.Load() {
++			device.log.Errorf("%v - UAPI: Triggering new PQC handshake", peer.Peer)
++			peer.SendHandshakeInitiation(false)
++		}
++
+ 	default:
+ 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI peer key: %v", key)
+ 	}
+diff --git a/go.mod b/go.mod
+index 37b0b6d..86e9cdb 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module github.com/tailscale/wireguard-go
+
+-go 1.25
++go 1.25.5
+
+ require (
+ 	golang.org/x/crypto v0.13.0
