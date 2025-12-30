@@ -263,17 +263,19 @@ func (msg *MessagePQCInitiation) unmarshal(b []byte) error {
 	copy(msg.Ephemeral[:], b[8:])
 	copy(msg.Static[:], b[40:])
 	copy(msg.Timestamp[:], b[88:])
-	copy(msg.MAC1[:], b[116:])
-	copy(msg.MAC2[:], b[132:])
 
 	// Unmarshal PQC extension fields (after standard 148 bytes)
-	offset := MessageInitiationSize
+	offset := 116
 	copy(msg.CTss[:], b[offset:])
 	offset += len(msg.CTss)
 	copy(msg.EI[:], b[offset:])
 	offset += len(msg.EI)
 	copy(msg.EncSI[:], b[offset:])
-	fmt.Printf("encsi %x", msg.EncSI)
+
+	offset += len(msg.EncSI)
+
+	copy(msg.MAC1[:], b[offset:])
+	copy(msg.MAC2[:], b[offset + 16:])
 
 
 	return nil
@@ -290,17 +292,18 @@ func (msg *MessagePQCInitiation) marshal(b []byte) error {
 	copy(b[8:], msg.Ephemeral[:])
 	copy(b[40:], msg.Static[:])
 	copy(b[88:], msg.Timestamp[:])
-	copy(b[116:], msg.MAC1[:])
-	copy(b[132:], msg.MAC2[:])
 
 	// Marshal PQC extension fields (after standard 148 bytes)
-	offset := MessageInitiationSize
+	offset := 116
 	copy(b[offset:], msg.CTss[:])
 	offset += len(msg.CTss)
 	copy(b[offset:], msg.EI[:])
 	offset += len(msg.EI)
 	copy(b[offset:], msg.EncSI[:])
-	fmt.Printf("encsi %x", msg.EncSI)
+	offset += len(msg.EncSI)
+
+	copy(b[offset:], msg.MAC1[:])
+	copy(b[offset + 16:], msg.MAC2[:])
 
 	return nil
 }
@@ -316,14 +319,16 @@ func (msg *MessagePQCResponse) unmarshal(b []byte) error {
 	msg.Receiver = binary.LittleEndian.Uint32(b[8:])
 	copy(msg.Ephemeral[:], b[12:])
 	copy(msg.Empty[:], b[44:])
-	copy(msg.MAC1[:], b[60:])
-	copy(msg.MAC2[:], b[76:])
 
 	// Unmarshal PQC extension fields (after standard 92 bytes)
-	offset := MessageResponseSize
+	offset := 60
 	copy(msg.CTee[:], b[offset:])
 	offset += len(msg.CTee)
 	copy(msg.CTse[:], b[offset:])
+	offset += len(msg.CTse)
+
+	copy(msg.MAC1[:], b[offset:])
+	copy(msg.MAC2[:], b[offset + 16:])
 
 	return nil
 }
@@ -339,14 +344,17 @@ func (msg *MessagePQCResponse) marshal(b []byte) error {
 	binary.LittleEndian.PutUint32(b[8:], msg.Receiver)
 	copy(b[12:], msg.Ephemeral[:])
 	copy(b[44:], msg.Empty[:])
-	copy(b[60:], msg.MAC1[:])
-	copy(b[76:], msg.MAC2[:])
+
 
 	// Marshal PQC extension fields (after standard 92 bytes)
-	offset := MessageResponseSize
+	offset := 60
 	copy(b[offset:], msg.CTee[:])
 	offset += len(msg.CTee)
 	copy(b[offset:], msg.CTse[:])
+	offset += len(msg.CTse)
+
+	copy(b[offset:], msg.MAC1[:])
+	copy(b[offset + 16:], msg.MAC2[:])
 
 	return nil
 }

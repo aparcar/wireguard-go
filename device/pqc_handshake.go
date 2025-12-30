@@ -148,7 +148,6 @@ func BuildPQCMsg1(localStaticPub NoisePQCPublicKey, remoteStaticPub NoisePQCPubl
 		return ctss, ei, nil, eiPriv, nil, fmt.Errorf("ss encapsulation failed: %w", err)
 	}
 	copy(ctss[:], ctSS[:])
-	fmt.Printf("ssSS %x\n", ssSS)
 
 	ks.mixHash(ctss[:])
 	ks.mixKey(ssSS[:])
@@ -163,7 +162,6 @@ func BuildPQCMsg1(localStaticPub NoisePQCPublicKey, remoteStaticPub NoisePQCPubl
 
 	// -> e
 	ks.mixHash(ei[:])
-	fmt.Printf("encSI %x\n", encSI)
 
 	// -> s (encrypt initiator static public key)
 	encSI, err = ks.encryptAndHash(localStaticPub[:])
@@ -209,7 +207,6 @@ func ProcessPQCMsg1(
 	ks.mixHash(ei[:])
 
 	// <- s (decrypt initiator static public key)
-	fmt.Printf("encSI %x\n", encSI)
 
 	siBytes, err := ks.decryptAndHash(encSI)
 	if err != nil {
