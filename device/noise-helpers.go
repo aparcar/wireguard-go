@@ -9,8 +9,11 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash"
+	"io"
 
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/curve25519"
@@ -105,4 +108,52 @@ func (sk *NoisePrivateKey) sharedSecret(pk NoisePublicKey) (ss [NoisePublicKeySi
 		return ss, errInvalidPublicKey
 	}
 	return ss, nil
+}
+
+/* PQC key generation functions */
+
+// GeneratePQCKeypair generates a new ML-KEM-768 keypair from a random seed.
+// Returns the seed (64 bytes) and public key (1184 bytes) as hex strings.
+func GeneratePQCKeypair() (seedHex, publicKeyHex string, err error) {
+	var seed NoisePQCSeed
+	if _, err := io.ReadFull(rand.Reader, seed[:]); err != nil {
+		return "", "", fmt.Errorf("failed to generate random seed: %w", err)
+	}
+
+	publicKey, err := PQCPublicKeyFromSeed(seed)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to derive public key: %w", err)
+	}
+
+	seedHex = hex.EncodeToString(seed[:])
+	publicKeyHex = hex.EncodeToString(publicKey[:])
+
+	return seedHex, publicKeyHex, nil
+}
+
+// PQCPublicKeyFromSeed derives a PQC public key from a seed.
+func PQCPublicKeyFromSeed(seed NoisePQCSeed) (NoisePQCPublicKey, error) {
+	publicKey, _, err := PQCGenerateKeyPairFromSeed(seed)
+	if err != nil {
+		return NoisePQCPublicKey{}, err
+	}
+	return publicKey, nil
+}
+
+// ParsePQCSeedHex parses a hex-encoded PQC seed string.
+func ParsePQCSeedHex(hexStr string) (NoisePQCSeed, error) {
+	var seed NoisePQCSeed
+	if err := seed.FromHex(hexStr); err != nil {
+		return NoisePQCSeed{}, fmt.Errorf("failed to parse seed: %w", err)
+	}
+	return seed, nil
+}
+
+// ParsePQCPublicKeyHex parses a hex-encoded PQC public key string.
+func ParsePQCPublicKeyHex(hexStr string) (NoisePQCPublicKey, error) {
+	var pubKey NoisePQCPublicKey
+	if err := pubKey.FromHex(hexStr); err != nil {
+		return NoisePQCPublicKey{}, fmt.Errorf("failed to parse public key: %w", err)
+	}
+	return pubKey, nil
 }
