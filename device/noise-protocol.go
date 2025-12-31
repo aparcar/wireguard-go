@@ -875,9 +875,7 @@ func (device *Device) CreateMessagePQCInitiation(peer *Peer) (*MessagePQCInitiat
 		return nil, fmt.Errorf("ss encapsulation failed: %w", err)
 	}
 	msg.CTss = ctSS
-
 	handshake.mixPQCHash(ctSS[:])
-	handshake.mixPQCKey(ssSS[:])
 
 	// Generate PQC ephemeral key
 	eiPub, eiSk, err := PQCGenerateKeyPair()
@@ -891,14 +889,15 @@ func (device *Device) CreateMessagePQCInitiation(peer *Peer) (*MessagePQCInitiat
 	handshake.mixPQCHash(eiPub[:])
 
 	// -> s (encrypt initiator static public key)
-	// Derive encryption key from PQC chain key
+	// Use KDF2 to update chain key with shared secret AND derive encryption key
+	var encKey [chacha20poly1305.KeySize]byte
 	KDF2(
 		&handshake.chainKeyPQC,
-		&key,
+		&encKey,
 		handshake.chainKeyPQC[:],
-		nil,
+		ssSS[:],
 	)
-	aead, _ = chacha20poly1305.New(key[:])
+	aead, _ = chacha20poly1305.New(encKey[:])
 	aead.Seal(msg.EncSI[:0], ZeroNonce[:], localPQCStatic[:], handshake.hashPQC[:])
 	handshake.mixPQCHash(msg.EncSI[:])
 
@@ -1005,48 +1004,7 @@ func (device *Device) ConsumeMessagePQCInitiation(msg *MessagePQCInitiation, end
 	localPQCStatic := device.staticIdentity.pqcPublicKey
 	localPQCPrivateSeed := device.staticIdentity.pqcSeed
 
-	// Initialize PQC state with BLAKE2s
-	var hashPQC [blake2s.Size]byte
-	var chainKeyPQC [blake2s.Size]byte
-	hashPQC = InitialPQCHash
-	chainKeyPQC = InitialPQChainKey
-
-	// Pre-message: <- s (our static key)
-	mixHash(&hashPQC, &hashPQC, localPQCStatic[:])
-
-	// Bind timestamp to PQC transcript for hybrid protection
-	mixHash(&hashPQC, &hashPQC, timestamp[:])
-
-	// <- skem (decapsulate with our static key)
-	ssSS, err := PQCDecapsulate(localPQCPrivateSeed, msg.CTss)
-	if err != nil {
-		device.log.Errorf("PQC ss decapsulation failed: %v", err)
-		return nil
-	}
-	mixHash(&hashPQC, &hashPQC, msg.CTss[:])
-	mixKey(&chainKeyPQC, &chainKeyPQC, ssSS[:])
-
-	// <- e (initiator's ephemeral)
-	mixHash(&hashPQC, &hashPQC, msg.EI[:])
-
-	// <- s (decrypt initiator static public key)
-	KDF2(&chainKeyPQC, &key, chainKeyPQC[:], nil)
-	aead, _ = chacha20poly1305.New(key[:])
-	var initiatorStaticPub NoisePQCPublicKey
-	_, err = aead.Open(initiatorStaticPub[:0], ZeroNonce[:], msg.EncSI[:], hashPQC[:])
-	if err != nil {
-		device.log.Errorf("PQC failed to decrypt initiator static key: %v", err)
-		return nil
-	}
-	mixHash(&hashPQC, &hashPQC, msg.EncSI[:])
-
-	// Verify PQC key matches the peer we found via X25519
-	if !bytes.Equal(initiatorStaticPub[:], handshake.remotePQCStatic[:]) {
-		device.log.Errorf("%v - ConsumeMessagePQCInitiation: PQC key mismatch!", peer)
-		return nil
-	}
-
-	// Update handshake state with both X25519 and PQC data
+	// Update handshake state - we need the lock for PQC processing
 	handshake.mutex.Lock()
 
 	// Standard X25519 state
@@ -1062,9 +1020,49 @@ func (device *Device) ConsumeMessagePQCInitiation(msg *MessagePQCInitiation, end
 		handshake.lastInitiationConsumption = now
 	}
 
-	// PQC state (using BLAKE2s-based fields)
-	handshake.hashPQC = hashPQC
-	handshake.chainKeyPQC = chainKeyPQC
+	// Initialize PQC state
+	handshake.hashPQC = InitialPQCHash
+	handshake.chainKeyPQC = InitialPQChainKey
+
+	// Pre-message: <- s (our static key)
+	handshake.mixPQCHash(localPQCStatic[:])
+
+	// Bind timestamp to PQC transcript for hybrid protection
+	handshake.mixPQCHash(timestamp[:])
+
+	// <- skem (decapsulate with our static key)
+	ssSS, err := PQCDecapsulate(localPQCPrivateSeed, msg.CTss)
+	if err != nil {
+		handshake.mutex.Unlock()
+		device.log.Errorf("PQC ss decapsulation failed: %v", err)
+		return nil
+	}
+	handshake.mixPQCHash(msg.CTss[:])
+
+	// <- e (initiator's ephemeral)
+	handshake.mixPQCHash(msg.EI[:])
+
+	// <- s (decrypt initiator static public key)
+	// Use KDF2 to update chain key with shared secret AND derive decryption key
+	var encKey [chacha20poly1305.KeySize]byte
+	KDF2(&handshake.chainKeyPQC, &encKey, handshake.chainKeyPQC[:], ssSS[:])
+	aead, _ = chacha20poly1305.New(encKey[:])
+	var initiatorStaticPub NoisePQCPublicKey
+	_, err = aead.Open(initiatorStaticPub[:0], ZeroNonce[:], msg.EncSI[:], handshake.hashPQC[:])
+	if err != nil {
+		handshake.mutex.Unlock()
+		device.log.Errorf("PQC failed to decrypt initiator static key: %v", err)
+		return nil
+	}
+	handshake.mixPQCHash(msg.EncSI[:])
+
+	// Verify PQC key matches the peer we found via X25519
+	if !bytes.Equal(initiatorStaticPub[:], handshake.remotePQCStatic[:]) {
+		handshake.mutex.Unlock()
+		device.log.Errorf("%v - ConsumeMessagePQCInitiation: PQC key mismatch!", peer)
+		return nil
+	}
+
 	handshake.remotePQCEphemeral = msg.EI
 
 	handshake.state = handshakeInitiationConsumed
@@ -1142,9 +1140,9 @@ func (device *Device) CreateMessagePQCResponse(peer *Peer) (*MessagePQCResponse,
 	handshake.mixPQCKey(ssSE[:])
 
 	// Derive PQC key from final PQC chain key
-	var pqcKeyDerived [blake2s.Size]byte
-	KDF1(&pqcKeyDerived, handshake.chainKeyPQC[:], []byte("pqc-shared"))
-	copy(handshake.pqcKey[:], pqcKeyDerived[:])
+	var pqcKey [blake2s.Size]byte
+	KDF1(&pqcKey, handshake.chainKeyPQC[:], nil)
+	copy(handshake.pqcKey[:], pqcKey[:])
 
 	// === PART 3: Combine with preshared key ===
 	// Add combined preshared key (user PSK XOR PQC key)
@@ -1191,6 +1189,7 @@ func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
 	var (
 		hash     [blake2s.Size]byte
 		chainKey [blake2s.Size]byte
+		pqcKey   [blake2s.Size]byte
 	)
 
 	ok := func() bool {
@@ -1230,7 +1229,7 @@ func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
 
 		localPQCPrivateSeed := device.staticIdentity.pqcSeed
 
-		// Copy PQC state for local processing
+		// Copy PQC state for local processing (we have RLock, can't modify handshake directly)
 		hashPQC := handshake.hashPQC
 		chainKeyPQC := handshake.chainKeyPQC
 
@@ -1251,9 +1250,7 @@ func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
 		mixKey(&chainKeyPQC, &chainKeyPQC, ssSE[:])
 
 		// Derive PQC key from final PQC chain key
-		var pqcKeyDerived [blake2s.Size]byte
-		KDF1(&pqcKeyDerived, chainKeyPQC[:], []byte("pqc-shared"))
-		copy(handshake.pqcKey[:], pqcKeyDerived[:])
+		KDF1(&pqcKey, chainKeyPQC[:], nil)
 
 		// === PART 3: Validate with combined preshared key ===
 		// Combine preshared key (user PSK XOR PQC key)
@@ -1261,7 +1258,7 @@ func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
 		// Always XOR both keys to avoid timing attacks
 		var combinedKey NoisePresharedKey
 		for i := range combinedKey {
-			combinedKey[i] = handshake.presharedKey[i] ^ handshake.pqcKey[i]
+			combinedKey[i] = handshake.presharedKey[i] ^ pqcKey[i]
 		}
 
 		var tau [blake2s.Size]byte
@@ -1294,6 +1291,7 @@ func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
 
 	handshake.hash = hash
 	handshake.chainKey = chainKey
+	copy(handshake.pqcKey[:], pqcKey[:])
 	handshake.remoteIndex = msg.Sender
 	handshake.state = handshakeResponseConsumed
 
@@ -1301,6 +1299,7 @@ func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
 
 	setZero(hash[:])
 	setZero(chainKey[:])
+	setZero(pqcKey[:])
 
 	return lookup.peer
 }
