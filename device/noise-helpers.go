@@ -7,10 +7,14 @@ package device
 
 import (
 	"crypto/hmac"
+	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash"
+	"io"
 
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/curve25519"
@@ -105,4 +109,139 @@ func (sk *NoisePrivateKey) sharedSecret(pk NoisePublicKey) (ss [NoisePublicKeySi
 		return ss, errInvalidPublicKey
 	}
 	return ss, nil
+}
+
+/* PQC key generation functions */
+
+// GeneratePQCKeypair generates a new ML-KEM-768 keypair from a random seed.
+// Returns the seed (64 bytes) and public key (1184 bytes) as hex strings.
+func GeneratePQCKeypair() (seedHex, publicKeyHex string, err error) {
+	var seed NoisePQCSeed
+	if _, err := io.ReadFull(rand.Reader, seed[:]); err != nil {
+		return "", "", fmt.Errorf("failed to generate random seed: %w", err)
+	}
+
+	publicKey, err := PQCPublicKeyFromSeed(seed)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to derive public key: %w", err)
+	}
+
+	seedHex = hex.EncodeToString(seed[:])
+	publicKeyHex = hex.EncodeToString(publicKey[:])
+
+	return seedHex, publicKeyHex, nil
+}
+
+// PQCPublicKeyFromSeed derives a PQC public key from a seed.
+func PQCPublicKeyFromSeed(seed NoisePQCSeed) (NoisePQCPublicKey, error) {
+	publicKey, _, err := PQCGenerateKeyPairFromSeed(seed)
+	if err != nil {
+		return NoisePQCPublicKey{}, err
+	}
+	return publicKey, nil
+}
+
+// PQCGenerateKeyPair generates a new ML-KEM-768 keypair.
+// Returns the public key (encapsulation key) and seed for the private key.
+func PQCGenerateKeyPair() (NoisePQCPublicKey, NoisePQCSeed, error) {
+	var pubKey NoisePQCPublicKey
+	var seed NoisePQCSeed
+
+	dk, err := mlkem.GenerateKey768()
+	if err != nil {
+		return pubKey, seed, err
+	}
+
+	// Get the encapsulation (public) key
+	ek := dk.EncapsulationKey()
+	ekBytes := ek.Bytes()
+	if len(ekBytes) != NoisePQCPublicKeySize {
+		return pubKey, seed, errors.New("unexpected encapsulation key size")
+	}
+	copy(pubKey[:], ekBytes)
+
+	// Get the seed (decapsulation key bytes)
+	seedBytes := dk.Bytes()
+	if len(seedBytes) != NoisePQCSeedSize {
+		return pubKey, seed, errors.New("unexpected seed size")
+	}
+	copy(seed[:], seedBytes)
+
+	return pubKey, seed, nil
+}
+
+// PQCGenerateKeyPairFromSeed generates a deterministic ML-KEM-768 keypair from a seed.
+// The seed must be exactly NoisePQCSeedSize bytes.
+func PQCGenerateKeyPairFromSeed(seed NoisePQCSeed) (NoisePQCPublicKey, *mlkem.DecapsulationKey768, error) {
+	var pubKey NoisePQCPublicKey
+
+	dk, err := mlkem.NewDecapsulationKey768(seed[:])
+	if err != nil {
+		return pubKey, nil, err
+	}
+
+	// Get the encapsulation (public) key
+	ek := dk.EncapsulationKey()
+	ekBytes := ek.Bytes()
+	if len(ekBytes) != NoisePQCPublicKeySize {
+		return pubKey, nil, errors.New("unexpected encapsulation key size")
+	}
+	copy(pubKey[:], ekBytes)
+
+	return pubKey, dk, nil
+}
+
+// PQCEncapsulate performs ML-KEM-768 encapsulation using the peer's public key.
+// Returns the shared secret and ciphertext.
+// The ciphertext should be sent to the peer who can decapsulate it with their private key.
+func PQCEncapsulate(peerPublicKey NoisePQCPublicKey) (NoisePQCSharedSecret, NoisePQCCiphertext, error) {
+	var sharedSecret NoisePQCSharedSecret
+	var ciphertext NoisePQCCiphertext
+
+	// Create encapsulation key from peer's public key bytes
+	ek, err := mlkem.NewEncapsulationKey768(peerPublicKey[:])
+	if err != nil {
+		return sharedSecret, ciphertext, err
+	}
+
+	// Encapsulate to get shared secret and ciphertext
+	ssBytes, ctBytes := ek.Encapsulate()
+
+	if len(ssBytes) != NoisePQCSharedSecretSize {
+		return sharedSecret, ciphertext, errors.New("unexpected shared secret size")
+	}
+	copy(sharedSecret[:], ssBytes)
+
+	if len(ctBytes) != NoisePQCCiphertextSize {
+		return sharedSecret, ciphertext, errors.New("unexpected ciphertext size")
+	}
+	copy(ciphertext[:], ctBytes)
+
+	return sharedSecret, ciphertext, nil
+}
+
+// PQCDecapsulate performs ML-KEM-768 decapsulation using our seed.
+// Returns the shared secret derived from the ciphertext.
+// This recovers the same shared secret that was generated during encapsulation.
+func PQCDecapsulate(seed NoisePQCSeed, ciphertext NoisePQCCiphertext) (NoisePQCSharedSecret, error) {
+	var sharedSecret NoisePQCSharedSecret
+
+	// Create decapsulation key from seed
+	dk, err := mlkem.NewDecapsulationKey768(seed[:])
+	if err != nil {
+		return sharedSecret, err
+	}
+
+	// Decapsulate to recover the shared secret
+	ssBytes, err := dk.Decapsulate(ciphertext[:])
+	if err != nil {
+		return sharedSecret, err
+	}
+
+	if len(ssBytes) != NoisePQCSharedSecretSize {
+		return sharedSecret, errors.New("unexpected shared secret size")
+	}
+	copy(sharedSecret[:], ssBytes)
+
+	return sharedSecret, nil
 }

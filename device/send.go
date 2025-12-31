@@ -121,21 +121,47 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
-	msg, err := peer.device.CreateMessageInitiation(peer)
-	if err != nil {
-		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
-		return err
-	}
+	// Check if PQC is configured for this peer
+	peer.handshake.mutex.RLock()
+	usePQC := !peer.handshake.remotePQCStatic.IsZero()
+	deviceHasPQC := !peer.device.staticIdentity.pqcPublicKey.IsZero()
+	peer.device.log.Verbosef("%v - Handshake check: remotePQCStatic.IsZero()=%v, deviceHasPQC=%v, usePQC=%v",
+		peer, peer.handshake.remotePQCStatic.IsZero(), deviceHasPQC, usePQC)
+	peer.handshake.mutex.RUnlock()
 
-	buf := make([]byte, MessageEncapsulatingTransportSize+MessageInitiationSize)
-	packet := buf[MessageEncapsulatingTransportSize:]
-	_ = msg.marshal(packet)
-	peer.cookieGenerator.AddMacs(packet)
+	var buf []byte
+	var packet []byte
+
+	if usePQC {
+		peer.device.log.Verbosef("%v - Using PQC handshake initiation", peer)
+		msgPQC, err := peer.device.CreateMessagePQCInitiation(peer)
+		if err != nil {
+			peer.device.log.Errorf("%v - Failed to create PQC initiation message: %v", peer, err)
+			return err
+		}
+
+		buf = make([]byte, MessageEncapsulatingTransportSize+MessagePQCInitiationSize)
+		packet = buf[MessageEncapsulatingTransportSize:]
+		_ = msgPQC.marshal(packet)
+		peer.cookieGenerator.AddMacs(packet)
+	} else {
+		peer.device.log.Verbosef("%v - Using classic handshake initiation", peer)
+		msg, err := peer.device.CreateMessageInitiation(peer)
+		if err != nil {
+			peer.device.log.Errorf("%v - Failed to create classic initiation message: %v", peer, err)
+			return err
+		}
+
+		buf = make([]byte, MessageEncapsulatingTransportSize+MessageInitiationSize)
+		packet = buf[MessageEncapsulatingTransportSize:]
+		_ = msg.marshal(packet)
+		peer.cookieGenerator.AddMacs(packet)
+	}
 
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	err = peer.SendBuffers([][]byte{buf})
+	err := peer.SendBuffers([][]byte{buf})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
 	}
@@ -176,6 +202,41 @@ func (peer *Peer) SendHandshakeResponse() error {
 	err = peer.SendBuffers([][]byte{buf})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
+	}
+	return err
+}
+
+func (peer *Peer) SendHandshakePQCResponse() error {
+	peer.handshake.mutex.Lock()
+	peer.handshake.lastSentHandshake = time.Now()
+	peer.handshake.mutex.Unlock()
+
+	peer.device.log.Verbosef("%v - Sending PQC handshake response", peer)
+
+	response, err := peer.device.CreateMessagePQCResponse(peer)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to create PQC response message: %v", peer, err)
+		return err
+	}
+
+	buf := make([]byte, MessageEncapsulatingTransportSize+MessagePQCResponseSize)
+	packet := buf[MessageEncapsulatingTransportSize:]
+	_ = response.marshal(packet)
+	peer.cookieGenerator.AddMacs(packet)
+
+	err = peer.BeginSymmetricSession()
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
+		return err
+	}
+
+	peer.timersSessionDerived()
+	peer.timersAnyAuthenticatedPacketTraversal()
+	peer.timersAnyAuthenticatedPacketSent()
+
+	err = peer.SendBuffers([][]byte{buf})
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to send PQC handshake response: %v", peer, err)
 	}
 	return err
 }

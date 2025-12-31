@@ -70,6 +70,18 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 		}
 		buf.WriteByte('\n')
 	}
+	// pqcKeyf outputs PQC keys (variable length) as hex
+	pqcKeyf := func(prefix string, key []byte) {
+		buf.Grow(len(key)*2 + 2 + len(prefix))
+		buf.WriteString(prefix)
+		buf.WriteByte('=')
+		const hex = "0123456789abcdef"
+		for i := 0; i < len(key); i++ {
+			buf.WriteByte(hex[key[i]>>4])
+			buf.WriteByte(hex[key[i]&0xf])
+		}
+		buf.WriteByte('\n')
+	}
 
 	func() {
 		// lock required resources
@@ -89,6 +101,11 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			keyf("private_key", (*[32]byte)(&device.staticIdentity.privateKey))
 		}
 
+		// Output device's PQC public key if set
+		if !device.staticIdentity.pqcPublicKey.IsZero() {
+			pqcKeyf("pqc_public_key", device.staticIdentity.pqcPublicKey[:])
+		}
+
 		if device.net.port != 0 {
 			sendf("listen_port=%d", device.net.port)
 		}
@@ -101,7 +118,18 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			// Serialize peer state.
 			peer.handshake.mutex.RLock()
 			keyf("public_key", (*[32]byte)(&peer.handshake.remoteStatic))
-			keyf("preshared_key", (*[32]byte)(&peer.handshake.presharedKey))
+
+			// Return the effective PSK being used by WireGuard (presharedKey ⊕ pqcKey)
+			var effectivePSK NoisePresharedKey
+			for i := range effectivePSK {
+				effectivePSK[i] = peer.handshake.presharedKey[i] ^ peer.handshake.pqcKey[i]
+			}
+			keyf("preshared_key", (*[32]byte)(&effectivePSK))
+
+			// Output peer's PQC public key if set
+			if !peer.handshake.remotePQCStatic.IsZero() {
+				pqcKeyf("pqc_public_key", peer.handshake.remotePQCStatic[:])
+			}
 			peer.handshake.mutex.RUnlock()
 			sendf("protocol_version=1")
 			peer.endpoint.Lock()
@@ -239,6 +267,16 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		}
 		device.log.Verbosef("UAPI: Removing all peers")
 		device.RemoveAllPeers()
+
+	case "pqc_private_key":
+		// Set the device's PQC (ML-KEM-768) seed for post-quantum handshakes
+		var seed NoisePQCSeed
+		err := seed.FromHex(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_private_key: %w", err)
+		}
+		device.log.Verbosef("UAPI: Setting PQC seed (hex len=%d, seed len=%d)", len(value), len(seed))
+		device.SetPQCSeed(seed)
 
 	default:
 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI device key: %v", key)
@@ -384,6 +422,25 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 	case "protocol_version":
 		if value != "1" {
 			return ipcErrorf(ipc.IpcErrorInvalid, "invalid protocol version: %v", value)
+		}
+
+	case "pqc_public_key":
+		// Set the peer's PQC (ML-KEM-768) public key for post-quantum handshakes
+		device.log.Verbosef("%v - UAPI: Setting PQC public key (hex len=%d)", peer.Peer, len(value))
+
+		peer.handshake.mutex.Lock()
+		err := peer.handshake.remotePQCStatic.FromHex(value)
+		peer.handshake.mutex.Unlock()
+
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_public_key: %w", err)
+		}
+		device.log.Verbosef("%v - UAPI: Successfully set PQC public key", peer.Peer)
+
+		// Trigger a new handshake initiation now that PQC is configured
+		if peer.isRunning.Load() {
+			device.log.Verbosef("%v - UAPI: Triggering new PQC handshake", peer.Peer)
+			peer.SendHandshakeInitiation(false)
 		}
 
 	default:

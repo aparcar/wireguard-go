@@ -15,6 +15,12 @@ const (
 	NoisePublicKeySize    = 32
 	NoisePrivateKeySize   = 32
 	NoisePresharedKeySize = 32
+
+	// PQC key sizes for ML-KEM-768 (post-quantum key encapsulation)
+	NoisePQCPublicKeySize    = 1184 // ML-KEM-768 public key (encapsulation key)
+	NoisePQCSeedSize         = 64   // ML-KEM-768 seed for deterministic key generation (d || z)
+	NoisePQCCiphertextSize   = 1088 // ML-KEM-768 ciphertext
+	NoisePQCSharedSecretSize = 32   // ML-KEM-768 shared secret
 )
 
 type (
@@ -22,6 +28,12 @@ type (
 	NoisePrivateKey   [NoisePrivateKeySize]byte
 	NoisePresharedKey [NoisePresharedKeySize]byte
 	NoiseNonce        uint64 // padded to 12-bytes
+
+	// PQC key types for ML-KEM-768 post-quantum cryptography
+	NoisePQCPublicKey    [NoisePQCPublicKeySize]byte
+	NoisePQCSeed         [NoisePQCSeedSize]byte // Seed for deterministic key generation
+	NoisePQCCiphertext   [NoisePQCCiphertextSize]byte
+	NoisePQCSharedSecret [NoisePQCSharedSecretSize]byte
 )
 
 func loadExactHex(dst []byte, src string) error {
@@ -74,5 +86,33 @@ func (key NoisePublicKey) Equals(tar NoisePublicKey) bool {
 }
 
 func (key *NoisePresharedKey) FromHex(src string) error {
+	return loadExactHex(key[:], src)
+}
+
+// PQC key helper methods
+
+func (key NoisePQCPublicKey) IsZero() bool {
+	var zero NoisePQCPublicKey
+	return key.Equals(zero)
+}
+
+func (key NoisePQCPublicKey) Equals(tar NoisePQCPublicKey) bool {
+	return subtle.ConstantTimeCompare(key[:], tar[:]) == 1
+}
+
+func (key *NoisePQCPublicKey) FromHex(src string) error {
+	return loadExactHex(key[:], src)
+}
+
+func (key NoisePQCSeed) IsZero() bool {
+	var zero NoisePQCSeed
+	return key.Equals(zero)
+}
+
+func (key NoisePQCSeed) Equals(tar NoisePQCSeed) bool {
+	return subtle.ConstantTimeCompare(key[:], tar[:]) == 1
+}
+
+func (key *NoisePQCSeed) FromHex(src string) error {
 	return loadExactHex(key[:], src)
 }
