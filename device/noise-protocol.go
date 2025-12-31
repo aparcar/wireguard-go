@@ -49,10 +49,12 @@ func (hs handshakeState) String() string {
 }
 
 const (
-	NoiseConstruction = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
-	WGIdentifier      = "WireGuard v1 zx2c4 Jason@zx2c4.com"
-	WGLabelMAC1       = "mac1----"
-	WGLabelCookie     = "cookie--"
+	NoiseConstruction    = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+	PQCNoiseConstruction = "pqIK_PQKEM_ChaChaPoly_BLAKE2s"
+	WGIdentifier         = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+	PQCWGIdentifier      = "tbd"
+	WGLabelMAC1          = "mac1----"
+	WGLabelCookie        = "cookie--"
 )
 
 const (
@@ -275,8 +277,7 @@ func (msg *MessagePQCInitiation) unmarshal(b []byte) error {
 	offset += len(msg.EncSI)
 
 	copy(msg.MAC1[:], b[offset:])
-	copy(msg.MAC2[:], b[offset + 16:])
-
+	copy(msg.MAC2[:], b[offset+16:])
 
 	return nil
 }
@@ -303,7 +304,7 @@ func (msg *MessagePQCInitiation) marshal(b []byte) error {
 	offset += len(msg.EncSI)
 
 	copy(b[offset:], msg.MAC1[:])
-	copy(b[offset + 16:], msg.MAC2[:])
+	copy(b[offset+16:], msg.MAC2[:])
 
 	return nil
 }
@@ -328,7 +329,7 @@ func (msg *MessagePQCResponse) unmarshal(b []byte) error {
 	offset += len(msg.CTse)
 
 	copy(msg.MAC1[:], b[offset:])
-	copy(msg.MAC2[:], b[offset + 16:])
+	copy(msg.MAC2[:], b[offset+16:])
 
 	return nil
 }
@@ -345,7 +346,6 @@ func (msg *MessagePQCResponse) marshal(b []byte) error {
 	copy(b[12:], msg.Ephemeral[:])
 	copy(b[44:], msg.Empty[:])
 
-
 	// Marshal PQC extension fields (after standard 92 bytes)
 	offset := 60
 	copy(b[offset:], msg.CTee[:])
@@ -354,7 +354,7 @@ func (msg *MessagePQCResponse) marshal(b []byte) error {
 	offset += len(msg.CTse)
 
 	copy(b[offset:], msg.MAC1[:])
-	copy(b[offset + 16:], msg.MAC2[:])
+	copy(b[offset+16:], msg.MAC2[:])
 
 	return nil
 }
@@ -375,17 +375,21 @@ type Handshake struct {
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
+
 	// PQC state
-	remotePQCStatic     NoisePQCPublicKey // remote PQC public key
-	pqcEphemeralPrivate NoisePQCSeed      // PQC ephemeral private key (for initiation)
-	pqcKeySchedule      *pqKeySchedule    // PQC key schedule state
-	pqcRemoteEphemeral  NoisePQCPublicKey // remote PQC ephemeral key (stored during initiation consumption)
+	hashPQC            [blake2s.Size]byte // hash value
+	chainKeyPQC        [blake2s.Size]byte // chain key
+	remotePQCStatic    NoisePQCPublicKey  // remote PQC public key
+	localPQCEphemeral  NoisePQCSeed       // PQC ephemeral private key (for initiation)
+	remotePQCEphemeral NoisePQCPublicKey  // remote PQC ephemeral key (stored during initiation consumption)
 }
 
 var (
-	InitialChainKey [blake2s.Size]byte
-	InitialHash     [blake2s.Size]byte
-	ZeroNonce       [chacha20poly1305.NonceSize]byte
+	InitialChainKey   [blake2s.Size]byte
+	InitialPQChainKey [blake2s.Size]byte
+	InitialHash       [blake2s.Size]byte
+	InitialPQCHash    [blake2s.Size]byte
+	ZeroNonce         [chacha20poly1305.NonceSize]byte
 )
 
 func mixKey(dst, c *[blake2s.Size]byte, data []byte) {
@@ -417,11 +421,21 @@ func (h *Handshake) mixKey(data []byte) {
 	mixKey(&h.chainKey, &h.chainKey, data)
 }
 
+func (h *Handshake) mixPQCHash(data []byte) {
+	mixHash(&h.hashPQC, &h.hashPQC, data)
+}
+
+func (h *Handshake) mixPQCKey(data []byte) {
+	mixKey(&h.chainKeyPQC, &h.chainKeyPQC, data)
+}
+
 /* Do basic precomputations
  */
 func init() {
 	InitialChainKey = blake2s.Sum256([]byte(NoiseConstruction))
+	InitialPQChainKey = blake2s.Sum256([]byte(PQCNoiseConstruction))
 	mixHash(&InitialHash, &InitialChainKey, []byte(WGIdentifier))
+	mixHash(&InitialPQCHash, &InitialPQChainKey, []byte(PQCWGIdentifier))
 }
 
 func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, error) {
@@ -841,24 +855,52 @@ func (device *Device) CreateMessagePQCInitiation(peer *Peer) (*MessagePQCInitiat
 	handshake.mixHash(msg.Timestamp[:])
 
 	// === PART 2: PQC extension fields ===
-	// Append ML-KEM-768 fields for hybrid security
+	// Append ML-KEM-768 fields for hybrid security using BLAKE2s
+
+	handshake.chainKeyPQC = InitialPQChainKey
+	handshake.hashPQC = InitialPQCHash
 
 	localPQCStatic := device.staticIdentity.pqcPublicKey
 
-	// Build PQC Msg1 with timestamp bound to PQC transcript for hybrid protection
-	ctss, ei, encSI, eiPriv, ks, err := BuildPQCMsg1(localPQCStatic, handshake.remotePQCStatic, timestamp)
+	// Pre-message: <- s (responder's static key is known)
+	handshake.mixPQCHash(handshake.remotePQCStatic[:])
+
+	// Bind timestamp to PQC transcript for hybrid protection
+	// This ensures an attacker must break both X25519 AND ML-KEM-768 to forge timestamps
+	handshake.mixPQCHash(timestamp[:])
+
+	// -> skem (encapsulate to responder's static key)
+	ssSS, ctSS, err := PQCEncapsulate(handshake.remotePQCStatic)
 	if err != nil {
-		return nil, fmt.Errorf("BuildPQCMsg1 failed: %w", err)
+		return nil, fmt.Errorf("ss encapsulation failed: %w", err)
 	}
+	msg.CTss = ctSS
 
-	// Store ephemeral private key and key schedule for later
-	handshake.pqcEphemeralPrivate = eiPriv
-	handshake.pqcKeySchedule = ks
+	handshake.mixPQCHash(ctSS[:])
+	handshake.mixPQCKey(ssSS[:])
 
-	// Add PQC fields to message
-	msg.CTss = ctss
-	msg.EI = ei
-	copy(msg.EncSI[:], encSI)
+	// Generate PQC ephemeral key
+	eiPub, eiSk, err := PQCGenerateKeyPair()
+	if err != nil {
+		return nil, fmt.Errorf("ephemeral key generation failed: %w", err)
+	}
+	handshake.localPQCEphemeral = eiSk
+	msg.EI = eiPub
+
+	// -> e
+	handshake.mixPQCHash(eiPub[:])
+
+	// -> s (encrypt initiator static public key)
+	// Derive encryption key from PQC chain key
+	KDF2(
+		&handshake.chainKeyPQC,
+		&key,
+		handshake.chainKeyPQC[:],
+		nil,
+	)
+	aead, _ = chacha20poly1305.New(key[:])
+	aead.Seal(msg.EncSI[:0], ZeroNonce[:], localPQCStatic[:], handshake.hashPQC[:])
+	handshake.mixPQCHash(msg.EncSI[:])
 
 	// Assign index
 	device.indexTable.Delete(handshake.localIndex)
@@ -958,37 +1000,51 @@ func (device *Device) ConsumeMessagePQCInitiation(msg *MessagePQCInitiation, end
 	}
 
 	// === PART 2: Process PQC extension fields ===
-	// This validates the ML-KEM-768 fields for hybrid security
+	// This validates the ML-KEM-768 fields for hybrid security using BLAKE2s
 
 	localPQCStatic := device.staticIdentity.pqcPublicKey
 	localPQCPrivateSeed := device.staticIdentity.pqcSeed
 
-	device.log.Errorf("ConsumeMessagePQCInitiation: Processing PQC Msg1 with localPQCStatic len=%d", len(localPQCStatic))
-	// Pass timestamp to PQC processing for hybrid protection
-	// This binds the timestamp to the PQC transcript, ensuring an attacker must
-	// break both X25519 AND ML-KEM-768 to forge timestamps
-	initiatorStaticPub, ks, err := ProcessPQCMsg1(
-		localPQCStatic,
-		localPQCPrivateSeed,
-		msg.CTss,
-		msg.EI,
-		msg.EncSI[:],
-		timestamp,
-	)
+	// Initialize PQC state with BLAKE2s
+	var hashPQC [blake2s.Size]byte
+	var chainKeyPQC [blake2s.Size]byte
+	hashPQC = InitialPQCHash
+	chainKeyPQC = InitialPQChainKey
+
+	// Pre-message: <- s (our static key)
+	mixHash(&hashPQC, &hashPQC, localPQCStatic[:])
+
+	// Bind timestamp to PQC transcript for hybrid protection
+	mixHash(&hashPQC, &hashPQC, timestamp[:])
+
+	// <- skem (decapsulate with our static key)
+	ssSS, err := PQCDecapsulate(localPQCPrivateSeed, msg.CTss)
 	if err != nil {
-		device.log.Errorf("ProcessPQCMsg1 failed: %v", err)
+		device.log.Errorf("PQC ss decapsulation failed: %v", err)
 		return nil
 	}
+	mixHash(&hashPQC, &hashPQC, msg.CTss[:])
+	mixKey(&chainKeyPQC, &chainKeyPQC, ssSS[:])
 
-	device.log.Errorf("ConsumeMessagePQCInitiation: Successfully decrypted initiator static key, len=%d", len(initiatorStaticPub))
+	// <- e (initiator's ephemeral)
+	mixHash(&hashPQC, &hashPQC, msg.EI[:])
+
+	// <- s (decrypt initiator static public key)
+	KDF2(&chainKeyPQC, &key, chainKeyPQC[:], nil)
+	aead, _ = chacha20poly1305.New(key[:])
+	var initiatorStaticPub NoisePQCPublicKey
+	_, err = aead.Open(initiatorStaticPub[:0], ZeroNonce[:], msg.EncSI[:], hashPQC[:])
+	if err != nil {
+		device.log.Errorf("PQC failed to decrypt initiator static key: %v", err)
+		return nil
+	}
+	mixHash(&hashPQC, &hashPQC, msg.EncSI[:])
 
 	// Verify PQC key matches the peer we found via X25519
 	if !bytes.Equal(initiatorStaticPub[:], handshake.remotePQCStatic[:]) {
 		device.log.Errorf("%v - ConsumeMessagePQCInitiation: PQC key mismatch!", peer)
 		return nil
 	}
-
-	device.log.Errorf("%v - ConsumeMessagePQCInitiation: Both X25519 and PQC validation passed", peer)
 
 	// Update handshake state with both X25519 and PQC data
 	handshake.mutex.Lock()
@@ -1006,9 +1062,10 @@ func (device *Device) ConsumeMessagePQCInitiation(msg *MessagePQCInitiation, end
 		handshake.lastInitiationConsumption = now
 	}
 
-	// PQC state
-	handshake.pqcKeySchedule = ks
-	handshake.pqcRemoteEphemeral = msg.EI
+	// PQC state (using BLAKE2s-based fields)
+	handshake.hashPQC = hashPQC
+	handshake.chainKeyPQC = chainKeyPQC
+	handshake.remotePQCEphemeral = msg.EI
 
 	handshake.state = handshakeInitiationConsumed
 	handshake.mutex.Unlock()
@@ -1026,10 +1083,6 @@ func (device *Device) CreateMessagePQCResponse(peer *Peer) (*MessagePQCResponse,
 
 	if handshake.state != handshakeInitiationConsumed {
 		return nil, errors.New("handshake initiation must be consumed first")
-	}
-
-	if handshake.pqcKeySchedule == nil {
-		return nil, errors.New("PQC key schedule not initialized")
 	}
 
 	// === PART 1: Standard X25519 response ===
@@ -1068,24 +1121,30 @@ func (device *Device) CreateMessagePQCResponse(peer *Peer) (*MessagePQCResponse,
 	}
 	handshake.mixKey(ss[:])
 
-	// === PART 2: PQC extension fields ===
+	// === PART 2: PQC extension fields using BLAKE2s ===
 
-	// Build PQC Msg2
-	ctee, ctse, psk, err := BuildPQCMsg2(
-		handshake.pqcRemoteEphemeral,
-		handshake.remotePQCStatic,
-		handshake.pqcKeySchedule,
-	)
+	// <- ekem (encapsulate to initiator's ephemeral key)
+	ssEE, ctEE, err := PQCEncapsulate(handshake.remotePQCEphemeral)
 	if err != nil {
-		return nil, fmt.Errorf("BuildPQCMsg2 failed: %w", err)
+		return nil, fmt.Errorf("ee encapsulation failed: %w", err)
 	}
+	msg.CTee = ctEE
+	handshake.mixPQCHash(ctEE[:])
+	handshake.mixPQCKey(ssEE[:])
 
-	// Store PQC-derived key
-	handshake.pqcKey = psk
+	// <- skem (encapsulate to initiator's static key)
+	ssSE, ctSE, err := PQCEncapsulate(handshake.remotePQCStatic)
+	if err != nil {
+		return nil, fmt.Errorf("se encapsulation failed: %w", err)
+	}
+	msg.CTse = ctSE
+	handshake.mixPQCHash(ctSE[:])
+	handshake.mixPQCKey(ssSE[:])
 
-	// Add PQC fields to message
-	msg.CTee = ctee
-	msg.CTse = ctse
+	// Derive PQC key from final PQC chain key
+	var pqcKeyDerived [blake2s.Size]byte
+	KDF1(&pqcKeyDerived, handshake.chainKeyPQC[:], []byte("pqc-shared"))
+	copy(handshake.pqcKey[:], pqcKeyDerived[:])
 
 	// === PART 3: Combine with preshared key ===
 	// Add combined preshared key (user PSK XOR PQC key)
@@ -1143,10 +1202,6 @@ func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
 			return false
 		}
 
-		if handshake.pqcKeySchedule == nil {
-			return false
-		}
-
 		// lock private key for reading
 		device.staticIdentity.RLock()
 		defer device.staticIdentity.RUnlock()
@@ -1171,25 +1226,34 @@ func (device *Device) ConsumeMessagePQCResponse(msg *MessagePQCResponse) *Peer {
 		mixKey(&chainKey, &chainKey, ss[:])
 		setZero(ss[:])
 
-		// === PART 2: Process PQC extension fields ===
+		// === PART 2: Process PQC extension fields using BLAKE2s ===
 
 		localPQCPrivateSeed := device.staticIdentity.pqcSeed
 
-		// Process PQC Msg2
-		psk, err := ProcessPQCMsg2(
-			handshake.pqcEphemeralPrivate,
-			localPQCPrivateSeed,
-			msg.CTee,
-			msg.CTse,
-			handshake.pqcKeySchedule,
-		)
+		// Copy PQC state for local processing
+		hashPQC := handshake.hashPQC
+		chainKeyPQC := handshake.chainKeyPQC
+
+		// <- ekem (decapsulate with our ephemeral key)
+		mixHash(&hashPQC, &hashPQC, msg.CTee[:])
+		ssEE, err := PQCDecapsulate(handshake.localPQCEphemeral, msg.CTee)
 		if err != nil {
 			return false
 		}
+		mixKey(&chainKeyPQC, &chainKeyPQC, ssEE[:])
 
-		// Store PQC-derived key temporarily (will be committed if validation passes)
-		// We need to store it now because it's used in the combined key below
-		handshake.pqcKey = psk
+		// <- skem (decapsulate with our static key)
+		mixHash(&hashPQC, &hashPQC, msg.CTse[:])
+		ssSE, err := PQCDecapsulate(localPQCPrivateSeed, msg.CTse)
+		if err != nil {
+			return false
+		}
+		mixKey(&chainKeyPQC, &chainKeyPQC, ssSE[:])
+
+		// Derive PQC key from final PQC chain key
+		var pqcKeyDerived [blake2s.Size]byte
+		KDF1(&pqcKeyDerived, chainKeyPQC[:], []byte("pqc-shared"))
+		copy(handshake.pqcKey[:], pqcKeyDerived[:])
 
 		// === PART 3: Validate with combined preshared key ===
 		// Combine preshared key (user PSK XOR PQC key)
