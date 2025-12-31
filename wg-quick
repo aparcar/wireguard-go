@@ -31,6 +31,8 @@ SAVE_CONFIG=0
 CONFIG_FILE=""
 PROGRAM="${0##*/}"
 ARGS=( "$@" )
+PQC_PRIVATE_KEY=""
+declare -A PEER_PQC_PUBLIC_KEYS
 
 cmd() {
 	echo "[#] $*" >&2
@@ -47,7 +49,7 @@ die() {
 CONFIG_SEARCH_PATHS=( /etc/wireguard /usr/local/etc/wireguard /opt/homebrew/etc/wireguard )
 
 parse_options() {
-	local interface_section=0 line key value stripped path v
+	local interface_section=0 peer_section=0 current_peer="" line key value stripped path v
 	CONFIG_FILE="$1"
 	if [[ $CONFIG_FILE =~ ^[a-zA-Z0-9_=+.-]{1,15}$ ]]; then
 		for path in "${CONFIG_SEARCH_PATHS[@]}"; do
@@ -65,8 +67,9 @@ parse_options() {
 		stripped="${line%%\#*}"
 		key="${stripped%%=*}"; key="${key##*([[:space:]])}"; key="${key%%*([[:space:]])}"
 		value="${stripped#*=}"; value="${value##*([[:space:]])}"; value="${value%%*([[:space:]])}"
-		[[ $key == "["* ]] && interface_section=0
+		[[ $key == "["* ]] && interface_section=0 && peer_section=0
 		[[ $key == "[Interface]" ]] && interface_section=1
+		[[ $key == "[Peer]" ]] && peer_section=1 && current_peer=""
 		if [[ $interface_section -eq 1 ]]; then
 			case "$key" in
 			Address) ADDRESSES+=( ${value//,/ } ); continue ;;
@@ -80,6 +83,17 @@ parse_options() {
 			PostUp) POST_UP+=( "$value" ); continue ;;
 			PostDown) POST_DOWN+=( "$value" ); continue ;;
 			SaveConfig) read_bool SAVE_CONFIG "$value"; continue ;;
+			PQCPrivateKey) PQC_PRIVATE_KEY="$value"; continue ;;
+			esac
+		fi
+		if [[ $peer_section -eq 1 ]]; then
+			case "$key" in
+			PublicKey) current_peer="$value" ;;
+			PQCPublicKey)
+				if [[ -n $current_peer ]]; then
+					PEER_PQC_PUBLIC_KEYS["$current_peer"]="$value"
+				fi
+				continue ;;
 			esac
 		fi
 		WG_CONFIG+="$line"$'\n'
@@ -372,13 +386,19 @@ add_route() {
 }
 
 set_config() {
-	cmd ./wg-pqc set "$REAL_INTERFACE" pqc-private-key "$INTERFACE".sec
 	cmd wg setconf "$REAL_INTERFACE" <(echo "$WG_CONFIG")
-	if [[ "$CONFIG_FILE" = *"tun90.conf" ]]; then
-	     cmd ./wg-pqc set "$REAL_INTERFACE" peer "tjVByx+NgbPyKIMPvLbMiQKqroZhM0cmnOaCkm6zeFA=" pqc-public-key "$(cat tun80.pub)"
-	else
-        cmd ./wg-pqc set "$REAL_INTERFACE" peer "lX0H/iHu+RJMQbg0m5xFhXXnZkJPa4aBdTByxs7LW2c=" pqc-public-key "$(cat tun90.pub)"
+	if [[ -n $PQC_PRIVATE_KEY ]]; then
+		# Write base64 key to temp file for wg-pqc
+		local pqc_key_file
+		pqc_key_file="$(mktemp)"
+		echo "$PQC_PRIVATE_KEY" > "$pqc_key_file"
+		cmd wg-pqc set "$REAL_INTERFACE" pqc-private-key "$pqc_key_file"
+		rm -f "$pqc_key_file"
 	fi
+	local peer
+	for peer in "${!PEER_PQC_PUBLIC_KEYS[@]}"; do
+		cmd wg-pqc set "$REAL_INTERFACE" peer "$peer" pqc-public-key "${PEER_PQC_PUBLIC_KEYS[$peer]}"
+	done
 }
 
 save_config() {
@@ -452,6 +472,13 @@ cmd_usage() {
 	    to configure DNS. The string \`%i' is expanded to INTERFACE.
 	  - SaveConfig: if set to \`true', the configuration is saved from the current
 	    state of the interface upon shutdown.
+	  - PQCPrivateKey: an optional post-quantum private key (ML-KEM-768 seed)
+	    for the interface, as a base64 string (64 bytes).
+
+	  Additionally, the following option is supported in [Peer] sections:
+
+	  - PQCPublicKey: an optional post-quantum public key (ML-KEM-768) for the
+	    peer, as a base64 string (1184 bytes).
 
 	See wg-quick(8) for more info and examples.
 	_EOF

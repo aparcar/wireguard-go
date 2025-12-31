@@ -125,7 +125,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.handshake.mutex.RLock()
 	usePQC := !peer.handshake.remotePQCStatic.IsZero()
 	deviceHasPQC := !peer.device.staticIdentity.pqcPublicKey.IsZero()
-	peer.device.log.Errorf("%v - Handshake check: remotePQCStatic.IsZero()=%v, deviceHasPQC=%v, usePQC=%v",
+	peer.device.log.Verbosef("%v - Handshake check: remotePQCStatic.IsZero()=%v, deviceHasPQC=%v, usePQC=%v",
 		peer, peer.handshake.remotePQCStatic.IsZero(), deviceHasPQC, usePQC)
 	peer.handshake.mutex.RUnlock()
 
@@ -133,7 +133,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	var packet []byte
 
 	if usePQC {
-		peer.device.log.Errorf("%v - Using PQC handshake initiation", peer)
+		peer.device.log.Verbosef("%v - Using PQC handshake initiation", peer)
 		msgPQC, err := peer.device.CreateMessagePQCInitiation(peer)
 		if err != nil {
 			peer.device.log.Errorf("%v - Failed to create PQC initiation message: %v", peer, err)
@@ -145,7 +145,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		_ = msgPQC.marshal(packet)
 		peer.cookieGenerator.AddMacs(packet)
 	} else {
-		peer.device.log.Errorf("%v - Using classic handshake initiation", peer)
+		peer.device.log.Verbosef("%v - Using classic handshake initiation", peer)
 		msg, err := peer.device.CreateMessageInitiation(peer)
 		if err != nil {
 			peer.device.log.Errorf("%v - Failed to create classic initiation message: %v", peer, err)
@@ -211,7 +211,7 @@ func (peer *Peer) SendHandshakePQCResponse() error {
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
-	peer.device.log.Errorf("%v - Sending PQC handshake response", peer)
+	peer.device.log.Verbosef("%v - Sending PQC handshake response", peer)
 
 	response, err := peer.device.CreateMessagePQCResponse(peer)
 	if err != nil {

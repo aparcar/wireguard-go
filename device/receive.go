@@ -436,7 +436,7 @@ func (device *Device) RoutineHandshake(id int) {
 			peer.SendKeepalive()
 
 		case MessagePQCInitiationType:
-			device.log.Errorf("Processing PQC initiation message")
+			device.log.Verbosef("Processing PQC initiation message")
 
 			// unmarshal
 			var msg MessagePQCInitiation
@@ -460,13 +460,13 @@ func (device *Device) RoutineHandshake(id int) {
 			// update endpoint
 			peer.SetEndpointFromPacket(elem.endpoint)
 
-			device.log.Errorf("%v - Received PQC handshake initiation", peer)
+			device.log.Verbosef("%v - Received PQC handshake initiation", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
 
 			peer.SendHandshakePQCResponse()
 
 		case MessagePQCResponseType:
-			device.log.Errorf("Processing PQC response message")
+			device.log.Verbosef("Processing PQC response message")
 
 			// unmarshal
 			var msg MessagePQCResponse
@@ -486,7 +486,7 @@ func (device *Device) RoutineHandshake(id int) {
 			// update endpoint
 			peer.SetEndpointFromPacket(elem.endpoint)
 
-			device.log.Errorf("%v - Received PQC handshake response", peer)
+			device.log.Verbosef("%v - Received PQC handshake response", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
 
 			// update timers

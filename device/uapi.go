@@ -275,7 +275,7 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_private_key: %w", err)
 		}
-		device.log.Errorf("UAPI: Setting PQC seed (hex len=%d, seed len=%d)", len(value), len(seed))
+		device.log.Verbosef("UAPI: Setting PQC seed (hex len=%d, seed len=%d)", len(value), len(seed))
 		device.SetPQCSeed(seed)
 
 	default:
@@ -426,7 +426,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 
 	case "pqc_public_key":
 		// Set the peer's PQC (ML-KEM-768) public key for post-quantum handshakes
-		device.log.Errorf("%v - UAPI: Setting PQC public key (hex len=%d)", peer.Peer, len(value))
+		device.log.Verbosef("%v - UAPI: Setting PQC public key (hex len=%d)", peer.Peer, len(value))
 
 		peer.handshake.mutex.Lock()
 		err := peer.handshake.remotePQCStatic.FromHex(value)
@@ -435,11 +435,11 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_public_key: %w", err)
 		}
-		device.log.Errorf("%v - UAPI: Successfully set PQC public key", peer.Peer)
+		device.log.Verbosef("%v - UAPI: Successfully set PQC public key", peer.Peer)
 
 		// Trigger a new handshake initiation now that PQC is configured
 		if peer.isRunning.Load() {
-			device.log.Errorf("%v - UAPI: Triggering new PQC handshake", peer.Peer)
+			device.log.Verbosef("%v - UAPI: Triggering new PQC handshake", peer.Peer)
 			peer.SendHandshakeInitiation(false)
 		}
 
