@@ -53,6 +53,9 @@ type Device struct {
 		sync.RWMutex
 		privateKey NoisePrivateKey
 		publicKey  NoisePublicKey
+		// PQC (Post-Quantum Cryptography) keys for ML-KEM-768
+		pqcSeed      NoisePQCSeed
+		pqcPublicKey NoisePQCPublicKey
 	}
 
 	peers struct {
@@ -280,6 +283,30 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	for _, peer := range expiredPeers {
 		peer.ExpireCurrentKeypairs()
 	}
+
+	return nil
+}
+
+// SetPQCSeed sets the device's PQC (ML-KEM-768) seed for post-quantum handshakes.
+// The corresponding public key is derived automatically.
+func (device *Device) SetPQCSeed(seed NoisePQCSeed) error {
+	device.staticIdentity.Lock()
+	defer device.staticIdentity.Unlock()
+
+	if seed.Equals(device.staticIdentity.pqcSeed) {
+		return nil
+	}
+
+	// Derive the public key from the seed (we don't need the decapsulation key here)
+	pub, _, err := PQCGenerateKeyPairFromSeed(seed)
+	if err != nil {
+		return err
+	}
+
+	device.staticIdentity.pqcSeed = seed
+	device.staticIdentity.pqcPublicKey = pub
+
+	device.log.Verbosef("PQC seed set, public key derived")
 
 	return nil
 }
