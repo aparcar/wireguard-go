@@ -100,6 +100,12 @@ func (peer *Peer) SendKeepalive() {
 }
 
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+	// Check if PQC handshake should be used
+	// Both device and peer must have PQC keys configured
+	if peer.device.HasPQCKeys() && peer.HasPQCKey() {
+		return peer.SendHandshakePQCInitiation(isRetry)
+	}
+
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)
 	}

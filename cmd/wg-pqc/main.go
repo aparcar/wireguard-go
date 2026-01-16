@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -21,49 +22,65 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  - McEliece6688128 for static keys (NIST Level 5, 256-bit security)\n")
 	fmt.Fprintf(os.Stderr, "  - Kyber512 for ephemeral keys (NIST Level 1, forward secrecy)\n")
 	fmt.Fprintf(os.Stderr, "\nCommands:\n")
-	fmt.Fprintf(os.Stderr, "  genkey                              Generate a new PQC keypair (slow, outputs to files)\n")
+	fmt.Fprintf(os.Stderr, "  genseed                             Generate a new PQC seed (32 bytes)\n")
+	fmt.Fprintf(os.Stderr, "  pubkey                              Derive public key from seed (reads seed from stdin)\n")
 	fmt.Fprintf(os.Stderr, "  set <interface> [options]           Configure PQC keys for an interface\n")
 	fmt.Fprintf(os.Stderr, "  show <interface> [peer]             Show PQC configuration for an interface\n")
 	fmt.Fprintf(os.Stderr, "  get <interface>                     Get raw UAPI configuration (for debugging)\n")
 	fmt.Fprintf(os.Stderr, "\nSet command options:\n")
-	fmt.Fprintf(os.Stderr, "  pqc-private-key <file>              Set device PQC private key from file (hex-encoded)\n")
+	fmt.Fprintf(os.Stderr, "  pqc-seed <file>                     Set device PQC keys from seed file (hex, 32 bytes)\n")
 	fmt.Fprintf(os.Stderr, "  peer <public-key>                   Specify peer by WireGuard public key (base64)\n")
-	fmt.Fprintf(os.Stderr, "  pqc-public-key <file>               Set peer's PQC public key from file (hex-encoded)\n")
+	fmt.Fprintf(os.Stderr, "  pqc-public-key <file>               Set peer's PQC public key (must follow peer)\n")
 	fmt.Fprintf(os.Stderr, "\nExamples:\n")
-	fmt.Fprintf(os.Stderr, "  # Generate a new keypair (outputs pqc-private.key, pqc-public.key)\n")
-	fmt.Fprintf(os.Stderr, "  %s genkey\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "\n  # Set device PQC private key\n")
-	fmt.Fprintf(os.Stderr, "  %s set wg0 pqc-private-key pqc-private.key\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  # Generate a seed (32 bytes)\n")
+	fmt.Fprintf(os.Stderr, "  %s genseed > pqc.seed\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "\n  # Derive public key from seed (for sharing with peers)\n")
+	fmt.Fprintf(os.Stderr, "  %s pubkey < pqc.seed > pqc-public.key\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "\n  # Set device PQC keys from seed\n")
+	fmt.Fprintf(os.Stderr, "  %s set wg0 pqc-seed pqc.seed\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "\n  # Set peer's PQC public key\n")
 	fmt.Fprintf(os.Stderr, "  %s set wg0 peer <base64-wg-pubkey> pqc-public-key peer-pqc-public.key\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "\n  # Show PQC status\n")
 	fmt.Fprintf(os.Stderr, "  %s show wg0\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "\nKey Format:\n")
+	fmt.Fprintf(os.Stderr, "\nKey Sizes:\n")
+	fmt.Fprintf(os.Stderr, "  Seed:        %d bytes\n", device.NoisePQCSeedSize)
 	fmt.Fprintf(os.Stderr, "  Private key: %d bytes\n", device.NoiseMcEliecePrivateKeySize)
 	fmt.Fprintf(os.Stderr, "  Public key:  %d bytes (~1MB, pre-provision out-of-band)\n", device.NoiseMcEliecePublicKeySize)
 }
 
-func genkey() error {
-	fmt.Fprintf(os.Stderr, "Generating McEliece6688128 keypair (this may take a moment)...\n")
+func genseed() error {
+	seed := make([]byte, device.NoisePQCSeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		return fmt.Errorf("failed to generate random seed: %w", err)
+	}
+	fmt.Println(hex.EncodeToString(seed))
+	return nil
+}
 
-	publicKey, privateKey, err := device.GeneratePQCStaticKeypair()
+func pubkey() error {
+	// Read seed from stdin
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("failed to read seed from stdin: %w", err)
+	}
+	seedHex := strings.TrimSpace(line)
+
+	seed, err := hex.DecodeString(seedHex)
 	if err != nil {
-		return fmt.Errorf("failed to generate PQC keypair: %w", err)
+		return fmt.Errorf("invalid hex seed: %w", err)
+	}
+	if len(seed) != device.NoisePQCSeedSize {
+		return fmt.Errorf("seed must be %d bytes, got %d", device.NoisePQCSeedSize, len(seed))
 	}
 
-	// Write private key (hex-encoded)
-	if err := os.WriteFile("pqc-private.key", []byte(hex.EncodeToString(privateKey)+"\n"), 0600); err != nil {
-		return fmt.Errorf("failed to write private key: %w", err)
+	fmt.Fprintf(os.Stderr, "Deriving public key from seed (this may take a moment)...\n")
+	publicKey, _, err := device.DeriveKeyPairFromSeed(seed)
+	if err != nil {
+		return fmt.Errorf("failed to derive keypair: %w", err)
 	}
 
-	// Write public key (hex-encoded)
-	if err := os.WriteFile("pqc-public.key", []byte(hex.EncodeToString(publicKey)+"\n"), 0644); err != nil {
-		return fmt.Errorf("failed to write public key: %w", err)
-	}
-
-	fmt.Printf("Generated PQC keypair:\n")
-	fmt.Printf("  Private key: pqc-private.key (%d bytes)\n", len(privateKey))
-	fmt.Printf("  Public key:  pqc-public.key (%d bytes)\n", len(publicKey))
+	fmt.Println(hex.EncodeToString(publicKey))
 	return nil
 }
 
@@ -111,39 +128,39 @@ func setCommand(args []string) error {
 	var commands []string
 	commands = append(commands, "set=1")
 
-	var currentPeer string
+	inPeerContext := false
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 
 		switch arg {
-		case "pqc-private-key":
+		case "pqc-seed":
 			if i+1 >= len(args) {
-				return fmt.Errorf("missing value for pqc-private-key")
+				return fmt.Errorf("missing value for pqc-seed")
 			}
 			i++
-			keyFile := args[i]
+			seedFile := args[i]
 
-			// Read private key from file
-			data, err := os.ReadFile(keyFile)
+			// Read seed from file
+			data, err := os.ReadFile(seedFile)
 			if err != nil {
-				return fmt.Errorf("failed to read private PQC key file: %w", err)
+				return fmt.Errorf("failed to read PQC seed file: %w", err)
 			}
 
-			privKeyHex := strings.TrimSpace(string(data))
+			seedHex := strings.TrimSpace(string(data))
 
 			// Validate it's valid hex
-			privKeyBytes, err := hex.DecodeString(privKeyHex)
+			seedBytes, err := hex.DecodeString(seedHex)
 			if err != nil {
-				return fmt.Errorf("failed to decode hex private key: %w", err)
+				return fmt.Errorf("failed to decode hex seed: %w", err)
 			}
 
-			if len(privKeyBytes) != device.NoiseMcEliecePrivateKeySize {
-				return fmt.Errorf("invalid private PQC key length: expected %d bytes, got %d",
-					device.NoiseMcEliecePrivateKeySize, len(privKeyBytes))
+			if len(seedBytes) != device.NoisePQCSeedSize {
+				return fmt.Errorf("invalid PQC seed length: expected %d bytes, got %d",
+					device.NoisePQCSeedSize, len(seedBytes))
 			}
 
-			commands = append(commands, fmt.Sprintf("pqc_private_key=%s", privKeyHex))
+			commands = append(commands, fmt.Sprintf("pqc_seed=%s", seedHex))
 
 		case "peer":
 			if i+1 >= len(args) {
@@ -168,15 +185,15 @@ func setCommand(args []string) error {
 				peerKey = hex.EncodeToString(noiseKey[:])
 			}
 
-			currentPeer = peerKey
+			inPeerContext = true
 			commands = append(commands, fmt.Sprintf("public_key=%s", peerKey))
 
 		case "pqc-public-key":
+			if !inPeerContext {
+				return fmt.Errorf("pqc-public-key must be used after peer (use pqc-seed for device keys)")
+			}
 			if i+1 >= len(args) {
 				return fmt.Errorf("missing value for pqc-public-key")
-			}
-			if currentPeer == "" {
-				return fmt.Errorf("pqc-public-key must be used after peer")
 			}
 			i++
 			pqcPubKeyFile := args[i]
@@ -395,8 +412,10 @@ func main() {
 	// Execute command
 	var err error
 	switch command {
-	case "genkey":
-		err = genkey()
+	case "genseed":
+		err = genseed()
+	case "pubkey":
+		err = pubkey()
 	case "set":
 		err = setCommand(os.Args[2:])
 	case "show":

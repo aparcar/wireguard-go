@@ -233,6 +233,32 @@ func GeneratePQCStaticKeypair() (publicKey []byte, privateKey []byte, err error)
 	return publicKey, privateKey, nil
 }
 
+// NoisePQCSeedSize is the size of the seed used to derive McEliece keys
+const NoisePQCSeedSize = 32
+
+// DeriveKeyPairFromSeed derives a McEliece6688128 keypair deterministically from a 32-byte seed
+// This allows storing just the seed (~32 bytes) instead of the full private key (~14KB)
+// and public key (~1MB), regenerating them on demand
+func DeriveKeyPairFromSeed(seed []byte) (publicKey []byte, privateKey []byte, err error) {
+	if len(seed) != NoisePQCSeedSize {
+		return nil, nil, errors.New("seed must be 32 bytes")
+	}
+
+	pk, sk := mcElieceScheme.DeriveKeyPair(seed)
+
+	publicKey, err = pk.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	privateKey, err = sk.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return publicKey, privateKey, nil
+}
+
 // GenerateKyberEphemeralKeypair generates a new Kyber512 ephemeral keypair
 func GenerateKyberEphemeralKeypair() (pk NoiseKyberPublicKey, skBytes []byte, err error) {
 	kp, err := KyberGenerateKeyPair()
