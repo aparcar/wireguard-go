@@ -202,6 +202,16 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					continue
 				}
 
+			case MessagePQCInitiationType:
+				if len(packet) != MessagePQCInitiationSize {
+					continue
+				}
+
+			case MessagePQCResponseType:
+				if len(packet) != MessagePQCResponseSize {
+					continue
+				}
+
 			default:
 				device.log.Verbosef("Received message with unknown type")
 				continue
@@ -311,7 +321,8 @@ func (device *Device) RoutineHandshake(id int) {
 
 			goto skip
 
-		case MessageInitiationType, MessageResponseType:
+		case MessageInitiationType, MessageResponseType,
+			MessagePQCInitiationType, MessagePQCResponseType:
 
 			// check mac fields and maybe ratelimit
 
@@ -401,6 +412,81 @@ func (device *Device) RoutineHandshake(id int) {
 			peer.SetEndpointFromPacket(elem.endpoint)
 
 			device.log.Verbosef("%v - Received handshake response", peer)
+			peer.rxBytes.Add(uint64(len(elem.packet)))
+
+			// update timers
+
+			peer.timersAnyAuthenticatedPacketTraversal()
+			peer.timersAnyAuthenticatedPacketReceived()
+
+			// derive keypair
+
+			err = peer.BeginSymmetricSession()
+
+			if err != nil {
+				device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
+				goto skip
+			}
+
+			peer.timersSessionDerived()
+			peer.timersHandshakeComplete()
+			peer.SendKeepalive()
+
+		case MessagePQCInitiationType:
+
+			// unmarshal
+
+			var msg MessagePQCInitiation
+			err := msg.unmarshal(elem.packet)
+			if err != nil {
+				device.log.Errorf("Failed to decode PQC initiation message")
+				goto skip
+			}
+
+			// consume PQC initiation
+
+			peer := device.ConsumeMessagePQCInitiation(&msg, elem.endpoint)
+			if peer == nil {
+				device.log.Verbosef("Received invalid PQC initiation message from %s", elem.endpoint.DstToString())
+				goto skip
+			}
+
+			// update timers
+
+			peer.timersAnyAuthenticatedPacketTraversal()
+			peer.timersAnyAuthenticatedPacketReceived()
+
+			// update endpoint
+			peer.SetEndpointFromPacket(elem.endpoint)
+
+			device.log.Verbosef("%v - Received PQC handshake initiation", peer)
+			peer.rxBytes.Add(uint64(len(elem.packet)))
+
+			peer.SendHandshakePQCResponse()
+
+		case MessagePQCResponseType:
+
+			// unmarshal
+
+			var msg MessagePQCResponse
+			err := msg.unmarshal(elem.packet)
+			if err != nil {
+				device.log.Errorf("Failed to decode PQC response message")
+				goto skip
+			}
+
+			// consume PQC response
+
+			peer := device.ConsumeMessagePQCResponse(&msg)
+			if peer == nil {
+				device.log.Verbosef("Received invalid PQC response message from %s", elem.endpoint.DstToString())
+				goto skip
+			}
+
+			// update endpoint
+			peer.SetEndpointFromPacket(elem.endpoint)
+
+			device.log.Verbosef("%v - Received PQC handshake response", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
 
 			// update timers

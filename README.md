@@ -2,6 +2,75 @@
 
 This is an implementation of WireGuard in Go.
 
+## Post-Quantum Cryptography (PQC) Support
+
+This fork includes experimental support for a **compact hybrid post-quantum handshake** that fits within a single IPv6 MTU frame (1280 bytes). The implementation uses:
+
+- **McEliece6688128** for static keys (NIST Level 5, 256-bit security)
+- **Kyber512** for ephemeral keys (NIST Level 1, 128-bit forward secrecy)
+
+### How It Works
+
+The PQC handshake extends the standard WireGuard Noise protocol with post-quantum key encapsulation:
+
+1. McEliece public keys (~1MB) are **pre-provisioned out-of-band** (not transmitted in handshake)
+2. Only McEliece ciphertexts (208 bytes) are transmitted
+3. Kyber512 provides ephemeral forward secrecy with 800-byte public keys and 768-byte ciphertexts
+4. Both X25519 and PQC key material are mixed into the final session keys
+
+**Message sizes:**
+
+- PQC Initiation: 1204 bytes (fits in IPv6 MTU with 28 bytes headroom)
+- PQC Response: 1068 bytes (fits in IPv6 MTU with 164 bytes headroom)
+
+### Using wg-pqc
+
+The `wg-pqc` tool manages PQC keys using **seed-based key generation**, which allows storing just a 32-byte seed instead of the full ~14KB private key:
+
+```bash
+# Generate a new PQC seed (32 bytes)
+$ wg-pqc genseed > pqc.seed
+
+# Derive public key from seed (for sharing with peers)
+$ wg-pqc pubkey < pqc.seed > pqc-public.key
+
+# Configure device PQC keys from seed
+$ wg-pqc set wg0 pqc-seed pqc.seed
+
+# Configure peer's PQC public key
+$ wg-pqc set wg0 peer <base64-wg-pubkey> pqc-public-key peer-pqc-public.key
+
+# Show PQC configuration
+$ wg-pqc show wg0
+```
+
+### Key Sizes
+
+| Key Type    | Size                   | Notes                                 |
+| ----------- | ---------------------- | ------------------------------------- |
+| Seed        | 32 bytes               | Stored in config files                |
+| Private key | 13,932 bytes           | Derived from seed                     |
+| Public key  | 1,044,992 bytes (~1MB) | Must be shared with peers out-of-band |
+
+### Key Distribution
+
+Since McEliece public keys are ~1MB, they must be exchanged out-of-band before establishing a connection. Typical approaches:
+
+- Include in configuration management systems
+- Distribute via secure file transfer
+- Embed in provisioning systems
+
+### Testing PQC Handshake
+
+A test script is provided to verify PQC handshakes between two local wireguard-go instances:
+
+```bash
+# Run the PQC handshake test (requires root on Linux)
+$ sudo ./test-pqc-handshake.sh
+```
+
+The test creates two WireGuard interfaces, configures PQC keys using seeds, and verifies that the handshake uses the PQC protocol (1204-byte initiation, 1068-byte response).
+
 ## Usage
 
 Most Linux kernel WireGuard users are used to adding an interface with `ip link add wg0 type wireguard`. With wireguard-go, instead simply run:

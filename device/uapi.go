@@ -8,6 +8,7 @@ package device
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,18 @@ import (
 
 	"github.com/tailscale/wireguard-go/ipc"
 )
+
+// loadHexKey decodes a hex string into a byte slice of the expected size
+func loadHexKey(src string, expectedSize int) ([]byte, error) {
+	dst, err := hex.DecodeString(src)
+	if err != nil {
+		return nil, err
+	}
+	if len(dst) != expectedSize {
+		return nil, fmt.Errorf("key size mismatch: expected %d bytes, got %d", expectedSize, len(dst))
+	}
+	return dst, nil
+}
 
 type IPCError struct {
 	code int64 // error code
@@ -70,6 +83,18 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 		}
 		buf.WriteByte('\n')
 	}
+	// pqcKeyf outputs PQC keys (variable length) as hex
+	pqcKeyf := func(prefix string, key []byte) {
+		buf.Grow(len(key)*2 + 2 + len(prefix))
+		buf.WriteString(prefix)
+		buf.WriteByte('=')
+		const hex = "0123456789abcdef"
+		for i := 0; i < len(key); i++ {
+			buf.WriteByte(hex[key[i]>>4])
+			buf.WriteByte(hex[key[i]&0xf])
+		}
+		buf.WriteByte('\n')
+	}
 
 	func() {
 		// lock required resources
@@ -89,6 +114,11 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			keyf("private_key", (*[32]byte)(&device.staticIdentity.privateKey))
 		}
 
+		// Output device's PQC key ID if set
+		if len(device.staticIdentity.pqcPublicKey) > 0 {
+			pqcKeyf("pqc_key_id", device.staticIdentity.pqcKeyID[:])
+		}
+
 		if device.net.port != 0 {
 			sendf("listen_port=%d", device.net.port)
 		}
@@ -102,6 +132,10 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			peer.handshake.mutex.RLock()
 			keyf("public_key", (*[32]byte)(&peer.handshake.remoteStatic))
 			keyf("preshared_key", (*[32]byte)(&peer.handshake.presharedKey))
+			// Output peer's PQC key ID if set
+			if len(peer.handshake.remotePQCPublicKey) > 0 {
+				pqcKeyf("pqc_key_id", peer.handshake.remotePQCKeyID[:])
+			}
 			peer.handshake.mutex.RUnlock()
 			sendf("protocol_version=1")
 			peer.endpoint.Lock()
@@ -151,6 +185,8 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 	deviceConfig := true
 
 	scanner := bufio.NewScanner(r)
+	// Increase buffer size to handle large PQC keys (~1MB public key = ~2MB hex)
+	scanner.Buffer(make([]byte, 64*1024), 3*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
@@ -239,6 +275,49 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		}
 		device.log.Verbosef("UAPI: Removing all peers")
 		device.RemoveAllPeers()
+
+	case "pqc_private_key":
+		// Set the device's PQC (McEliece6688128) private key for post-quantum handshakes
+		device.log.Verbosef("UAPI: Setting PQC private key")
+		privateKey, err := loadHexKey(value, NoiseMcEliecePrivateKeySize)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_private_key: %w", err)
+		}
+		// Also need the public key to compute key ID - derive it or require separate set
+		// For now, require pqc_public_key to be set as well
+		device.staticIdentity.Lock()
+		device.staticIdentity.pqcPrivateKey = privateKey
+		device.staticIdentity.Unlock()
+
+	case "pqc_public_key":
+		// Set the device's PQC (McEliece6688128) public key
+		device.log.Verbosef("UAPI: Setting PQC public key")
+		publicKey, err := loadHexKey(value, NoiseMcEliecePublicKeySize)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_public_key: %w", err)
+		}
+		device.staticIdentity.Lock()
+		device.staticIdentity.pqcPublicKey = publicKey
+		device.staticIdentity.pqcKeyID = McElieceKeyIDFromBytes(publicKey)
+		device.staticIdentity.Unlock()
+
+	case "pqc_seed":
+		// Set the device's PQC keys by deriving them from a 32-byte seed
+		// This is more convenient than setting the full private/public keys separately
+		device.log.Verbosef("UAPI: Setting PQC keys from seed")
+		seed, err := loadHexKey(value, NoisePQCSeedSize)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_seed: %w", err)
+		}
+		publicKey, privateKey, err := DeriveKeyPairFromSeed(seed)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to derive PQC keys from seed: %w", err)
+		}
+		device.staticIdentity.Lock()
+		device.staticIdentity.pqcPublicKey = publicKey
+		device.staticIdentity.pqcPrivateKey = privateKey
+		device.staticIdentity.pqcKeyID = McElieceKeyIDFromBytes(publicKey)
+		device.staticIdentity.Unlock()
 
 	default:
 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI device key: %v", key)
@@ -385,6 +464,18 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		if value != "1" {
 			return ipcErrorf(ipc.IpcErrorInvalid, "invalid protocol version: %v", value)
 		}
+
+	case "pqc_public_key":
+		// Set the peer's PQC (McEliece6688128) public key for post-quantum handshakes
+		device.log.Verbosef("%v - UAPI: Setting PQC public key", peer.Peer)
+		publicKey, err := loadHexKey(value, NoiseMcEliecePublicKeySize)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set pqc_public_key: %w", err)
+		}
+		peer.handshake.mutex.Lock()
+		peer.handshake.remotePQCPublicKey = publicKey
+		peer.handshake.remotePQCKeyID = McElieceKeyIDFromBytes(publicKey)
+		peer.handshake.mutex.Unlock()
 
 	default:
 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI peer key: %v", key)
