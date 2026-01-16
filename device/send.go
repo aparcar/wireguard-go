@@ -180,6 +180,89 @@ func (peer *Peer) SendHandshakeResponse() error {
 	return err
 }
 
+// SendHandshakePQCInitiation sends a compact hybrid PQC handshake initiation
+// using McEliece6688128 for static keys and Kyber512 for ephemeral keys.
+func (peer *Peer) SendHandshakePQCInitiation(isRetry bool) error {
+	if !isRetry {
+		peer.timers.handshakeAttempts.Store(0)
+	}
+
+	peer.handshake.mutex.RLock()
+	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+		peer.handshake.mutex.RUnlock()
+		return nil
+	}
+	peer.handshake.mutex.RUnlock()
+
+	peer.handshake.mutex.Lock()
+	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+		peer.handshake.mutex.Unlock()
+		return nil
+	}
+	peer.handshake.lastSentHandshake = time.Now()
+	peer.handshake.mutex.Unlock()
+
+	peer.device.log.Verbosef("%v - Sending PQC handshake initiation", peer)
+
+	msg, err := peer.device.CreateMessagePQCInitiation(peer)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to create PQC initiation message: %v", peer, err)
+		return err
+	}
+
+	buf := make([]byte, MessageEncapsulatingTransportSize+MessagePQCInitiationSize)
+	packet := buf[MessageEncapsulatingTransportSize:]
+	_ = msg.marshal(packet)
+	peer.cookieGenerator.AddMacs(packet)
+
+	peer.timersAnyAuthenticatedPacketTraversal()
+	peer.timersAnyAuthenticatedPacketSent()
+
+	err = peer.SendBuffers([][]byte{buf})
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to send PQC handshake initiation: %v", peer, err)
+	}
+	peer.timersHandshakeInitiated()
+
+	return err
+}
+
+// SendHandshakePQCResponse sends a compact hybrid PQC handshake response
+func (peer *Peer) SendHandshakePQCResponse() error {
+	peer.handshake.mutex.Lock()
+	peer.handshake.lastSentHandshake = time.Now()
+	peer.handshake.mutex.Unlock()
+
+	peer.device.log.Verbosef("%v - Sending PQC handshake response", peer)
+
+	response, err := peer.device.CreateMessagePQCResponse(peer)
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to create PQC response message: %v", peer, err)
+		return err
+	}
+
+	buf := make([]byte, MessageEncapsulatingTransportSize+MessagePQCResponseSize)
+	packet := buf[MessageEncapsulatingTransportSize:]
+	_ = response.marshal(packet)
+	peer.cookieGenerator.AddMacs(packet)
+
+	err = peer.BeginSymmetricSession()
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
+		return err
+	}
+
+	peer.timersSessionDerived()
+	peer.timersAnyAuthenticatedPacketTraversal()
+	peer.timersAnyAuthenticatedPacketSent()
+
+	err = peer.SendBuffers([][]byte{buf})
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to send PQC handshake response: %v", peer, err)
+	}
+	return err
+}
+
 func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
 

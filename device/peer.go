@@ -123,6 +123,41 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	return peer, nil
 }
 
+// SetPQCPublicKey sets the remote peer's full McEliece public key for PQC handshakes
+// This also computes and sets the key ID (BLAKE2s hash of the public key)
+// The public key should be NoiseMcEliecePublicKeySize bytes (~1MB)
+func (p *Peer) SetPQCPublicKey(publicKey []byte) error {
+	if len(publicKey) != NoiseMcEliecePublicKeySize {
+		return errors.New("invalid McEliece public key size")
+	}
+
+	p.handshake.mutex.Lock()
+	defer p.handshake.mutex.Unlock()
+
+	// Store copy of the public key
+	p.handshake.remotePQCPublicKey = make([]byte, len(publicKey))
+	copy(p.handshake.remotePQCPublicKey, publicKey)
+
+	// Compute key ID
+	p.handshake.remotePQCKeyID = McElieceKeyIDFromBytes(publicKey)
+
+	return nil
+}
+
+// GetPQCKeyID returns the remote peer's McEliece key ID
+func (p *Peer) GetPQCKeyID() NoisePQCKeyID {
+	p.handshake.mutex.RLock()
+	defer p.handshake.mutex.RUnlock()
+	return p.handshake.remotePQCKeyID
+}
+
+// HasPQCKey returns true if the peer has a PQC public key configured
+func (p *Peer) HasPQCKey() bool {
+	p.handshake.mutex.RLock()
+	defer p.handshake.mutex.RUnlock()
+	return len(p.handshake.remotePQCPublicKey) > 0
+}
+
 // SetAllowedIPs sets the allowed IP prefixes for this peer.
 //
 // If the allowedIPs are unchanged since the last call, this method is a no-op.

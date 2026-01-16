@@ -53,6 +53,13 @@ type Device struct {
 		sync.RWMutex
 		privateKey NoisePrivateKey
 		publicKey  NoisePublicKey
+
+		// PQC: McEliece6688128 static keys (pre-provisioned out-of-band)
+		// Public key is ~1MB and stored as raw bytes
+		// Key ID is a BLAKE2s hash of the public key for identification
+		pqcPublicKey  []byte        // McEliece6688128 public key (~1MB)
+		pqcPrivateKey []byte        // McEliece6688128 private key (~14KB)
+		pqcKeyID      NoisePQCKeyID // BLAKE2s hash of public key
 	}
 
 	peers struct {
@@ -282,6 +289,47 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	}
 
 	return nil
+}
+
+// SetPQCKeys sets the McEliece6688128 static keys for PQC handshakes
+// The public key should be ~1MB (NoiseMcEliecePublicKeySize bytes)
+// The private key should be ~14KB (NoiseMcEliecePrivateKeySize bytes)
+func (device *Device) SetPQCKeys(publicKey, privateKey []byte) error {
+	if len(publicKey) != NoiseMcEliecePublicKeySize {
+		return errors.New("invalid McEliece public key size")
+	}
+	if len(privateKey) != NoiseMcEliecePrivateKeySize {
+		return errors.New("invalid McEliece private key size")
+	}
+
+	device.staticIdentity.Lock()
+	defer device.staticIdentity.Unlock()
+
+	// Store copies of the keys
+	device.staticIdentity.pqcPublicKey = make([]byte, len(publicKey))
+	copy(device.staticIdentity.pqcPublicKey, publicKey)
+
+	device.staticIdentity.pqcPrivateKey = make([]byte, len(privateKey))
+	copy(device.staticIdentity.pqcPrivateKey, privateKey)
+
+	// Compute key ID (BLAKE2s hash of public key)
+	device.staticIdentity.pqcKeyID = McElieceKeyIDFromBytes(publicKey)
+
+	return nil
+}
+
+// HasPQCKeys returns true if PQC keys have been configured
+func (device *Device) HasPQCKeys() bool {
+	device.staticIdentity.RLock()
+	defer device.staticIdentity.RUnlock()
+	return len(device.staticIdentity.pqcPublicKey) > 0
+}
+
+// GetPQCKeyID returns the device's PQC key ID
+func (device *Device) GetPQCKeyID() NoisePQCKeyID {
+	device.staticIdentity.RLock()
+	defer device.staticIdentity.RUnlock()
+	return device.staticIdentity.pqcKeyID
 }
 
 func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {

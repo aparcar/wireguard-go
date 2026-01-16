@@ -48,17 +48,21 @@ func (hs handshakeState) String() string {
 }
 
 const (
-	NoiseConstruction = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
-	WGIdentifier      = "WireGuard v1 zx2c4 Jason@zx2c4.com"
-	WGLabelMAC1       = "mac1----"
-	WGLabelCookie     = "cookie--"
+	NoiseConstruction    = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+	WGIdentifier         = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+	WGLabelMAC1          = "mac1----"
+	WGLabelCookie        = "cookie--"
+	PQCNoiseConstruction = "Noise_pqIK_McEliece6688128_Kyber512_ChaChaPoly_BLAKE2s"
+	PQCWGIdentifier      = "QuireGuard PQC v1" // No trademark
 )
 
 const (
-	MessageInitiationType  = 1
-	MessageResponseType    = 2
-	MessageCookieReplyType = 3
-	MessageTransportType   = 4
+	MessageInitiationType    = 1
+	MessageResponseType      = 2
+	MessageCookieReplyType   = 3
+	MessageTransportType     = 4
+	MessagePQCInitiationType = 5 // Compact PQC: McEliece6688128 + Kyber512
+	MessagePQCResponseType   = 6 // Compact PQC: McEliece6688128 + Kyber512
 )
 
 const (
@@ -70,6 +74,19 @@ const (
 	MessageTransportSize              = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
 	MessageKeepaliveSize              = MessageTransportSize                          // size of keepalive
 	MessageHandshakeSize              = MessageInitiationSize                         // size of largest handshake related message
+
+	// PQC message sizes - designed to fit in single IPv6 MTU (1280 bytes)
+	// Available payload after IPv6 (40) + UDP (8) headers = 1232 bytes
+	//
+	// PQC Initiation: 4 + 4 + 32 + 48 + 28 + 208 + 800 + 48 + 16 + 16 = 1204 bytes
+	//   Type(4) + Sender(4) + X25519Eph(32) + EncStatic(48) + EncTimestamp(28)
+	//   + McElieceCT(208) + KyberPK(800) + EncKeyID(48) + MAC1(16) + MAC2(16)
+	//
+	// PQC Response: 4 + 4 + 4 + 32 + 16 + 768 + 208 + 16 + 16 = 1068 bytes
+	//   Type(4) + Sender(4) + Receiver(4) + X25519Eph(32) + EncEmpty(16)
+	//   + KyberCT(768) + McElieceCT(208) + MAC1(16) + MAC2(16)
+	MessagePQCInitiationSize = 4 + 4 + 32 + (32 + 16) + (12 + 16) + NoiseMcElieceCiphertextSize + NoiseKyberPublicKeySize + (NoisePQCKeyIDSize + 16) + 16 + 16 // 1204 bytes
+	MessagePQCResponseSize   = 4 + 4 + 4 + 32 + 16 + NoiseKyberCiphertextSize + NoiseMcElieceCiphertextSize + 16 + 16                                          // 1068 bytes
 )
 
 const (
@@ -116,6 +133,43 @@ type MessageCookieReply struct {
 	Receiver uint32
 	Nonce    [chacha20poly1305.NonceSizeX]byte
 	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+}
+
+// MessagePQCInitiation is a compact hybrid PQC initiation message
+// Uses McEliece6688128 for static keys and Kyber512 for ephemeral keys
+// Fits in a single IPv6 MTU frame (1204 bytes < 1232 available)
+type MessagePQCInitiation struct {
+	Type      uint32
+	Sender    uint32
+	Ephemeral NoisePublicKey                              // X25519 ephemeral public key (32 bytes)
+	Static    [NoisePublicKeySize + poly1305.TagSize]byte // Encrypted X25519 static key (48 bytes)
+	Timestamp [tai64n.TimestampSize + poly1305.TagSize]byte
+
+	// PQC extension fields
+	CTss    NoiseMcElieceCiphertext                    // McEliece ciphertext to responder's static (208 bytes)
+	EI      NoiseKyberPublicKey                        // Kyber512 ephemeral public key (800 bytes)
+	EncSIid [NoisePQCKeyIDSize + poly1305.TagSize]byte // Encrypted initiator's PQC key ID (48 bytes)
+
+	MAC1 [blake2s.Size128]byte
+	MAC2 [blake2s.Size128]byte
+}
+
+// MessagePQCResponse is a compact hybrid PQC response message
+// Uses McEliece6688128 for static keys and Kyber512 for ephemeral keys
+// Fits in a single IPv6 MTU frame (1068 bytes < 1232 available)
+type MessagePQCResponse struct {
+	Type      uint32
+	Sender    uint32
+	Receiver  uint32
+	Ephemeral NoisePublicKey         // X25519 ephemeral public key (32 bytes)
+	Empty     [poly1305.TagSize]byte // Encrypted empty (16 bytes)
+
+	// PQC extension fields
+	CTee NoiseMcElieceCiphertext // McEliece ciphertext to initiator's static (208 bytes)
+	CTse NoiseKyberCiphertext    // Kyber512 ciphertext to initiator's ephemeral (768 bytes)
+
+	MAC1 [blake2s.Size128]byte
+	MAC2 [blake2s.Size128]byte
 }
 
 var errMessageLengthMismatch = errors.New("message length mismatch")
@@ -210,6 +264,118 @@ func (msg *MessageCookieReply) marshal(b []byte) error {
 	return nil
 }
 
+func (msg *MessagePQCInitiation) unmarshal(b []byte) error {
+	if len(b) != MessagePQCInitiationSize {
+		return errMessageLengthMismatch
+	}
+
+	offset := 0
+	msg.Type = binary.LittleEndian.Uint32(b[offset:])
+	offset += 4
+	msg.Sender = binary.LittleEndian.Uint32(b[offset:])
+	offset += 4
+	copy(msg.Ephemeral[:], b[offset:])
+	offset += len(msg.Ephemeral)
+	copy(msg.Static[:], b[offset:])
+	offset += len(msg.Static)
+	copy(msg.Timestamp[:], b[offset:])
+	offset += len(msg.Timestamp)
+	copy(msg.CTss[:], b[offset:])
+	offset += len(msg.CTss)
+	copy(msg.EI[:], b[offset:])
+	offset += len(msg.EI)
+	copy(msg.EncSIid[:], b[offset:])
+	offset += len(msg.EncSIid)
+	copy(msg.MAC1[:], b[offset:])
+	offset += len(msg.MAC1)
+	copy(msg.MAC2[:], b[offset:])
+
+	return nil
+}
+
+func (msg *MessagePQCInitiation) marshal(b []byte) error {
+	if len(b) != MessagePQCInitiationSize {
+		return errMessageLengthMismatch
+	}
+
+	offset := 0
+	binary.LittleEndian.PutUint32(b[offset:], msg.Type)
+	offset += 4
+	binary.LittleEndian.PutUint32(b[offset:], msg.Sender)
+	offset += 4
+	copy(b[offset:], msg.Ephemeral[:])
+	offset += len(msg.Ephemeral)
+	copy(b[offset:], msg.Static[:])
+	offset += len(msg.Static)
+	copy(b[offset:], msg.Timestamp[:])
+	offset += len(msg.Timestamp)
+	copy(b[offset:], msg.CTss[:])
+	offset += len(msg.CTss)
+	copy(b[offset:], msg.EI[:])
+	offset += len(msg.EI)
+	copy(b[offset:], msg.EncSIid[:])
+	offset += len(msg.EncSIid)
+	copy(b[offset:], msg.MAC1[:])
+	offset += len(msg.MAC1)
+	copy(b[offset:], msg.MAC2[:])
+
+	return nil
+}
+
+func (msg *MessagePQCResponse) unmarshal(b []byte) error {
+	if len(b) != MessagePQCResponseSize {
+		return errMessageLengthMismatch
+	}
+
+	offset := 0
+	msg.Type = binary.LittleEndian.Uint32(b[offset:])
+	offset += 4
+	msg.Sender = binary.LittleEndian.Uint32(b[offset:])
+	offset += 4
+	msg.Receiver = binary.LittleEndian.Uint32(b[offset:])
+	offset += 4
+	copy(msg.Ephemeral[:], b[offset:])
+	offset += len(msg.Ephemeral)
+	copy(msg.Empty[:], b[offset:])
+	offset += len(msg.Empty)
+	copy(msg.CTee[:], b[offset:])
+	offset += len(msg.CTee)
+	copy(msg.CTse[:], b[offset:])
+	offset += len(msg.CTse)
+	copy(msg.MAC1[:], b[offset:])
+	offset += len(msg.MAC1)
+	copy(msg.MAC2[:], b[offset:])
+
+	return nil
+}
+
+func (msg *MessagePQCResponse) marshal(b []byte) error {
+	if len(b) != MessagePQCResponseSize {
+		return errMessageLengthMismatch
+	}
+
+	offset := 0
+	binary.LittleEndian.PutUint32(b[offset:], msg.Type)
+	offset += 4
+	binary.LittleEndian.PutUint32(b[offset:], msg.Sender)
+	offset += 4
+	binary.LittleEndian.PutUint32(b[offset:], msg.Receiver)
+	offset += 4
+	copy(b[offset:], msg.Ephemeral[:])
+	offset += len(msg.Ephemeral)
+	copy(b[offset:], msg.Empty[:])
+	offset += len(msg.Empty)
+	copy(b[offset:], msg.CTee[:])
+	offset += len(msg.CTee)
+	copy(b[offset:], msg.CTse[:])
+	offset += len(msg.CTse)
+	copy(b[offset:], msg.MAC1[:])
+	offset += len(msg.MAC1)
+	copy(b[offset:], msg.MAC2[:])
+
+	return nil
+}
+
 type Handshake struct {
 	state                     handshakeState
 	mutex                     sync.RWMutex
@@ -225,12 +391,23 @@ type Handshake struct {
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
+
+	// PQC state for McEliece6688128 + Kyber512 hybrid handshake
+	hashPQC              [blake2s.Size]byte  // PQC hash value (separate transcript)
+	chainKeyPQC          [blake2s.Size]byte  // PQC chain key
+	pqcKey               NoisePresharedKey   // PQC-derived key mixed into final keys
+	remotePQCKeyID       NoisePQCKeyID       // Remote peer's McEliece key ID (hash of full public key)
+	remotePQCPublicKey   []byte              // Remote peer's full McEliece public key (~1MB, for encapsulation)
+	localKyberEphemeral  []byte              // Kyber512 ephemeral private key (initiator only)
+	remoteKyberEphemeral NoiseKyberPublicKey // Remote peer's Kyber512 ephemeral public key
 }
 
 var (
-	InitialChainKey [blake2s.Size]byte
-	InitialHash     [blake2s.Size]byte
-	ZeroNonce       [chacha20poly1305.NonceSize]byte
+	InitialChainKey    [blake2s.Size]byte
+	InitialHash        [blake2s.Size]byte
+	InitialPQCChainKey [blake2s.Size]byte
+	InitialPQCHash     [blake2s.Size]byte
+	ZeroNonce          [chacha20poly1305.NonceSize]byte
 )
 
 func mixKey(dst, c *[blake2s.Size]byte, data []byte) {
@@ -262,11 +439,21 @@ func (h *Handshake) mixKey(data []byte) {
 	mixKey(&h.chainKey, &h.chainKey, data)
 }
 
+func (h *Handshake) mixPQCHash(data []byte) {
+	mixHash(&h.hashPQC, &h.hashPQC, data)
+}
+
+func (h *Handshake) mixPQCKey(data []byte) {
+	mixKey(&h.chainKeyPQC, &h.chainKeyPQC, data)
+}
+
 /* Do basic precomputations
  */
 func init() {
 	InitialChainKey = blake2s.Sum256([]byte(NoiseConstruction))
 	mixHash(&InitialHash, &InitialChainKey, []byte(WGIdentifier))
+	InitialPQCChainKey = blake2s.Sum256([]byte(PQCNoiseConstruction))
+	mixHash(&InitialPQCHash, &InitialPQCChainKey, []byte(PQCWGIdentifier))
 }
 
 func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, error) {
